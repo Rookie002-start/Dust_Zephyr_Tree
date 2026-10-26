@@ -1,0 +1,93 @@
+From 955ba4b56a29b2b6b8a31ff3e8ebae8e4c871618 Mon Sep 17 00:00:00 2001
+From: Rookie002-start <200347378+Rookie002-start@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:34:14 +0800
+Subject: [PATCH] fix: synchronize chassis and gimbal updates
+
+---
+ thread/chassis/trd_chassis.cpp |  8 ++++----
+ thread/gimbal/trd_gimbal.cpp   | 27 +++++++++++++--------------
+ 2 files changed, 17 insertions(+), 18 deletions(-)
+
+diff --git a/thread/chassis/trd_chassis.cpp b/thread/chassis/trd_chassis.cpp
+index bffc0db..2980258 100644
+--- a/thread/chassis/trd_chassis.cpp
++++ b/thread/chassis/trd_chassis.cpp
+@@ -147,11 +147,11 @@ static float OptimalArc(float current, float& target)
+ static void ReadRemote()
+ {
+     static topic::remote_to::Message msg{};
+-    const zbus_channel *chan = nullptr;
++    static uint32_t remote_ver = 0;
+ 
+-    zbus_sub_wait(&sub_remote_to, &chan, K_NO_WAIT);
+-    if (chan) {
+-        zbus_chan_read(chan, &msg, K_NO_WAIT);
++    // remote_to 通道无订阅者：轮询最新值，version 变化才算新的一帧
++    if (zbus_chan_read(&pub_remote_to, &msg, K_NO_WAIT) == 0 && msg.version != remote_ver) {
++        remote_ver = msg.version;
+         g_vx =  msg.chassisx  * KMaxMoveVelocity;
+         g_vy =  msg.chassisy  * KMaxMoveVelocity;
+         g_vw = (msg.chassis_mode == topic::remote_to::ChassisMode::Spin) ? KMaxRotationOmega : 0.0f;
+diff --git a/thread/gimbal/trd_gimbal.cpp b/thread/gimbal/trd_gimbal.cpp
+index a4ae896..ee85c04 100644
+--- a/thread/gimbal/trd_gimbal.cpp
++++ b/thread/gimbal/trd_gimbal.cpp
+@@ -20,6 +20,7 @@
+ #include "zephyr/kernel.h"
+ #include "zephyr/sys/printk.h"
+ #include "zephyr/zbus/zbus.h"
++#include "trd_gimbal.hpp"
+ #include "timer.hpp"
+ 
+ namespace thread::gimbal {
+@@ -32,9 +33,9 @@ constexpr uint8_t kTaskRunningCycle = 1;                                    // 
+ constexpr float   kYawRadPerCycle   = 3.0f * kTaskRunningCycle * 0.001f;    // yaw   每周期弧度 0.001为 ms 转换到 s 的常数
+ constexpr float   kPitchRadPerCycle = 2.0f * kTaskRunningCycle * 0.001f;    // pitch 每周期弧度 0.001为 ms 转换到 s 的常数
+ 
+-// static float g_syaw_radian  = 0.0f;
+-static float g_byaw_radian  = 0.0f;
+-static float g_pitch_radian = 0.0f;
++// 操作手控制的的虚拟角度
++static float virtual_yaw_angle_ = 0.0f;
++static float virtual_pitch_angle_ = 0.0f;
+ 
+ static void ProcessMotor(GimbalModule& mod, float& radian, topic::to_can_tx::Message& msg, Timer& timer)
+ {
+@@ -83,18 +84,17 @@ static void Task(void*, void*, void*)
+     {
+         timer.Update();
+ 
+-        const zbus_channel *chan = nullptr;
+-        zbus_sub_wait(&sub_remote_to, &chan, K_NO_WAIT);
+-        if (chan) {
+-            topic::remote_to::Message rx{};
+-            zbus_chan_read(chan, &rx, K_NO_WAIT);
+-            g_byaw_radian  += rx.yaw   * kYawRadPerCycle;
+-            g_pitch_radian += rx.pitch * kPitchRadPerCycle;
++        // remote_to 通道无订阅者：轮询最新值，version 变化才算新的一帧
++        static topic::remote_to::Message rx{};
++        static uint32_t remote_ver = 0;
++        if (zbus_chan_read(&pub_remote_to, &rx, K_NO_WAIT) == 0 && rx.version != remote_ver) {
++            remote_ver = rx.version;
++            virtual_yaw_angle_  += rx.yaw   * kYawRadPerCycle;
++            virtual_pitch_angle_ += rx.pitch * kPitchRadPerCycle;
+         }
+ 
+-        ProcessMotor(big_yaw_, g_byaw_radian, msg, timer);
+-        // ProcessMotor(small_yaw_, g_syaw_radian, msg, timer);
+-        // ProcessMotor(pitch_, g_pitch_radian, msg, timer);
++        ProcessMotor(yaw_, virtual_yaw_angle_, msg, timer);
++        ProcessMotor(pitch_, virtual_pitch_angle_, msg, timer);
+ 
+         k_msleep(kTaskRunningCycle);
+     }
+@@ -182,6 +182,5 @@ REGISTER_THREAD(thread_start, MidThread,  Mid, "gimbal_start");
+ 
+ 
+ 
+-
+ 
+ 
+-- 
+2.53.0
+

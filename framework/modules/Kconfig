@@ -1,0 +1,141 @@
+# modules/Kconfig - hardware-facing modules built on top of drivers/topics
+
+config DUST_MOD_DEV_IMU
+    bool "IMU module"
+    default n
+    select DUST_FLT_QUATERNION
+    select DUST_TPC_IMU_TO
+    select DUST_CTL_TIMER
+    select DUST_ID_STABILITY
+    help
+        IMU source decoupling, attitude EKF and zbus publish layer.
+
+config DUST_MOD_DEV_IMU_HEATER
+    bool "IMU heater (PWM + PID)"
+    default y if DUST_MOD_DEV_IMU_BMI088 || DUST_MOD_DEV_IMU_ICM42688P
+    depends on DUST_MOD_DEV_IMU
+    select DUST_DEV_PWM
+    select DUST_CTL_PID
+    help
+        裸传感器（BMI088 / ICM42688P）的 PWM + PID 恒温加热器。
+        默认随裸传感器一起打开；想先单独验证 IMU 通信时，在 prj.conf 里
+        写 CONFIG_DUST_MOD_DEV_IMU_HEATER=n 即可（加热器不初始化、不更新 PWM，
+        IMU 采样/校准/解算照常）。自带封装且无加热器的成品模块（如 HiPNUC）
+        不选本项，ImuManager 会跳过加热器初始化与预热。
+
+config DUST_MOD_DEV_IMU_BMI088
+    bool "BMI088 IMU source"
+    default n
+    depends on DUST_MOD_DEV_IMU
+    select DUST_COM_SPI
+    select SPI_STM32_DMA
+    help
+        BMI088 source implementation for the IMU module.
+
+config DUST_MOD_DEV_IMU_ICM42688P
+    bool "ICM42688P IMU source"
+    default n
+    depends on DUST_MOD_DEV_IMU
+    select DUST_COM_SPI
+    help
+        ICM42688P source implementation for the IMU module.
+
+config DUST_MOD_DEV_IMU_HIPNUC
+    bool "HiPNUC IMU source"
+    default n
+    depends on DUST_MOD_DEV_IMU
+    select DUST_COM_UART_DMA
+    help
+        HiPNUC HI 系列串口 IMU（0x5A 0xA5 帧头 / 0x91 组合数据帧）。
+        模块自带姿态融合，直接输出欧拉角与四元数，上层旁路 EKF；
+        无加热器，也不做驱动侧零偏采集。
+
+config DUST_MOD_DEV_IMU_HIPNUC_CRC
+    bool "HiPNUC frame CRC16 check"
+    default n
+    depends on DUST_MOD_DEV_IMU_HIPNUC
+    help
+        对 0x91 数据帧做 CRC16 校验（poly 0x1021，init 0xFFFF）。
+        需与模块固件 / 旧驱动 CRC.h 的多项式一致；不一致时保持 n，
+        仅用 0x5A 0xA5 帧头 + LEN + tag 做结构校验。
+
+config DUST_MOD_DEV_IMU_IDENT
+    bool "IMU open-loop identification"
+    default n
+    depends on DUST_MOD_DEV_IMU
+    select DUST_ID_STABILITY
+    select DUST_COM_UART_DMA
+    select DUST_MOD_DEV_IMU_HEATER
+    help
+        IMU heater duty-step open-loop identification.
+
+config DUST_MOD_DEV_MOTOR_DJI
+    bool "DJI motor"
+    default n
+    select DUST_COM_CAN
+    help
+        DJI motor module.
+
+config DUST_MOD_DEV_MOTOR_DM
+    bool "DM motor"
+    default n
+    select DUST_COM_CAN
+    help
+        DM motor module.
+
+config DUST_MOD_DEV_POWERMETER
+    bool "Horizon power meter"
+    default n
+    select DUST_COM_CAN
+    help
+        Horizon power meter module.
+
+config DUST_MOD_DEV_REMOTE
+    bool "Remote receiver"
+    default n
+    select DUST_COM_UART_DMA
+    select DUST_TPC_REMOTE_TO
+    help
+        Remote receiver module.
+
+config DUST_MOD_DEV_REMOTE_DUAL
+    bool "Dual remote support"
+    default n
+    depends on DUST_MOD_DEV_REMOTE
+    help
+        Enable two independent remote receiver instances.
+
+config DUST_MOD_DEV_REMOTE_AUTO
+    bool "Auto link all protocols"
+    default n
+    depends on DUST_MOD_DEV_REMOTE
+    help
+        Automatically link all available protocol sources.
+
+config DUST_MOD_DEV_REMOTE_DR16
+    bool "DR16 protocol"
+    default n
+    depends on DUST_MOD_DEV_REMOTE
+    help
+        DR16 remote protocol.
+
+config DUST_MOD_DEV_REMOTE_SBUS
+    bool "SBUS protocol"
+    default n
+    depends on DUST_MOD_DEV_REMOTE
+    help
+        SBUS remote protocol.
+
+config DUST_MOD_DEV_REMOTE_VT12
+    bool "VT12 protocol"
+    default n
+    depends on DUST_MOD_DEV_REMOTE
+    help
+        VT12 remote protocol (mouse + keyboard).
+
+config DUST_MOD_DEV_REMOTE_VT13
+    bool "VT13 protocol"
+    default n
+    depends on DUST_MOD_DEV_REMOTE
+    help
+        VT13 remote protocol (full-featured).

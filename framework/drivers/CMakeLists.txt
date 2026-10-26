@@ -1,0 +1,46 @@
+if(CONFIG_DUST_COM_CAN)
+    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/communication/can/can.cpp)
+    target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/communication/can)
+endif()
+
+if(CONFIG_DUST_COM_RS485)
+    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/communication/stream/rs485/rs485.cpp)
+    target_include_directories(app PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/communication/stream/rs485
+        ${CMAKE_CURRENT_SOURCE_DIR}/communication/stream/uart
+        ${CMAKE_CURRENT_SOURCE_DIR}/communication/stream
+    )
+endif()
+
+if(CONFIG_DUST_COM_SPI)
+    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/communication/spi/spi.cpp)
+    target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/communication/spi)
+endif()
+
+if(CONFIG_DUST_COM_UART_DMA)
+    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/communication/stream/uart/uart.cpp)
+    target_include_directories(app PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/communication/stream/uart
+        ${CMAKE_CURRENT_SOURCE_DIR}/communication/stream
+    )
+endif()
+
+if(CONFIG_DUST_DEV_GPIO_INPUT)
+    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/gpio/input.cpp)
+    target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/gpio)
+endif()
+
+if(CONFIG_DUST_DEV_GPIO_OUTPUT)
+    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/gpio/output.cpp)
+    target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/gpio)
+endif()
+
+if(CONFIG_DUST_DEV_PWM)
+    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/pwm/pwm.cpp)
+    target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device/pwm)
+endif()
+
+# USB 协议栈（归位后独立库，参考 CherryUSB 装配：drivers 层 add_subdirectory + 子目录 zephyr_library）
+if(CONFIG_DUST_COM_USB)
+    add_subdirectory(communication/stream/usb)
+endif()

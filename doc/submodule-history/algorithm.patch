@@ -1,0 +1,1018 @@
+From a22b79e7b59f300cbf409a743c1862f94e080c4f Mon Sep 17 00:00:00 2001
+From: Rookie002-start <200347378+Rookie002-start@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:33:55 +0800
+Subject: [PATCH] feat: improve PID, power control and RLS
+
+---
+ controller/pid/pid.cpp               |  15 +-
+ controller/pid/pid.hpp               |   5 +
+ controller/power_ctrl/README.md      | 126 ++++++--
+ controller/power_ctrl/power_ctrl.hpp | 421 ++++++++++++++++++++++-----
+ identify/rls/rls.hpp                 |  71 ++++-
+ 5 files changed, 530 insertions(+), 108 deletions(-)
+
+diff --git a/controller/pid/pid.cpp b/controller/pid/pid.cpp
+index 3d264c3..e2b59be 100644
+--- a/controller/pid/pid.cpp
++++ b/controller/pid/pid.cpp
+@@ -127,13 +127,16 @@ float Pid::CalcImpl(float error)
+         integralError_ = std::clamp(integralError_, -iClamp, iClamp);
+     }
+ 
+-    // 防卡角: 输出饱和或误差反向时清零
+-    float absOut = fabsf(out_);
+-    if ((cfg_.outMax != 0.0f && absOut >= cfg_.outMax) ||
+-        (preError_ > 0.0f && error < 0.0f)             ||
+-        (preError_ < 0.0f && error > 0.0f))
++    // 防卡角: 输出饱和或误差反向时清零（cfg_.antiStuckReset = false 可关闭，见 pid.hpp）
++    if (cfg_.antiStuckReset)
+     {
+-        integralError_ = 0.0f;
++        float absOut = fabsf(out_);
++        if ((cfg_.outMax != 0.0f && absOut >= cfg_.outMax) ||
++            (preError_ > 0.0f && error < 0.0f)             ||
++            (preError_ < 0.0f && error > 0.0f))
++        {
++            integralError_ = 0.0f;
++        }
+     }
+ 
+     // 积分分离（与 iSpeedThreshHi 功能重叠，关闭一个即可）
+diff --git a/controller/pid/pid.hpp b/controller/pid/pid.hpp
+index b6de4ea..c5c124b 100644
+--- a/controller/pid/pid.hpp
++++ b/controller/pid/pid.hpp
+@@ -62,6 +62,11 @@ public:
+         float iSeparateThresh  = 0.0f;                  // 积分分离阈值（0 = 关闭。与 iSpeedThreshHi 功能重叠，建议二选一）
+         DFirst dFirst          = DFirst::Disable;
+         float dLpfCutoffHz     = 0.0f;                  // D 项 LPF 截止频率（Hz，0 = 无滤波；alpha = 1/(1 + 2πfc·dt)）
++        /// 防卡角：输出饱和或误差反向时清零积分。默认开（保持原行为）。
++        /// ⚠️ 跟踪环（如云台角速度环）建议关：参考量一直在动，误差符号每拍都在翻，
++        ///    开了会让积分被反复清掉、控制器退化成近似 P 环，稳态到不了给定。
++        ///    关掉后积分仍受 iOutMax 限幅（iClamp = iOutMax/ki）约束，不会无限饱和。
++        bool  antiStuckReset   = true;
+     };
+ 
+     Pid() = default;
+diff --git a/controller/power_ctrl/README.md b/controller/power_ctrl/README.md
+index 03849de..d358aa4 100644
+--- a/controller/power_ctrl/README.md
++++ b/controller/power_ctrl/README.md
+@@ -14,45 +14,85 @@ PowerCtrl 管理一组同类型电机，基于功率模型预测各电机功耗
+ ## 功率模型
+ 
+ ```
+-P_in = K1 · τ² + K2 · ω² + τ · ω + K3
++P_in = K1 · τ² + K2 · ω² + η · τ · ω + K3
+ ```
+ 
+ | 项 | 物理含义 | 说明 |
+ |----|----------|------|
+ | K1·τ² | 铜损 | 绕组电阻发热，与转矩平方成正比 |
+ | K2·ω² | 铁损 + 摩擦 | 磁滞/涡流损耗 + 轴承摩擦，与转速平方成正比 |
+-| τ·ω | 机械功率 | 实际对外做功，P_mech = τ·ω |
++| η·τ·ω | 机械功率 | 实际对外做功，P_mech = τ·ω，η 为固定系数（默认 1.0） |
+ | K3 | 常数损耗 | 控制器待机功耗、传感器供电等固定损耗 |
+ 
+-**辨识目标**：RLS 以 `x = [Στ², Σω²]` 为输入、`y = P_meas - K3` 为期望输出，在线拟合 K1（铜损系数）和 K2（铁损系数）。`τ·ω` 和 K3 是已知或可直接计算的项，不作为辨识参数。
++**辨识目标**：RLS 以 `x = [Στ², Σω²]` 为输入、`y = P_meas - ΣK3 - η·Στω` 为期望输出，在线拟合 K1（铜损系数）和 K2（铁损系数）。`η·τ·ω` 和 K3 是已知项，必须从拟合目标里减掉，不作为辨识参数 —— 否则它们会被 K1/K2 吸收一遍、预测时再加一遍（重复计入，预测偏高）。
++
++**K1 不能留默认值**：K1 的物理值是 `R / Kt²`（R = 相电阻 Ω，Kt = 转矩常数
++N·m/A）。以 M3508（Kt = 0.3 N·m/A、R ≈ 0.1~0.2 Ω）为例，K1 应在 **1~2** 量级；
++若沿用库默认的 `1.453e-7`，铜损项实际等于 0，模型只剩 `η·τ·ω + K3`，于是
++**ω → 0 而电流很大（堵转、顶障碍物）时预测功率仍远低于预算，限幅会完全不起作用**。
++标定前请先用 `R/Kt²` 估一个初值，再用实测数据核对。
++
++## 两套功率口径（关键）
++
++模型系数只有一组，但每个周期会算两遍：
++
++| 口径 | 转矩来源 | 用途 |
++|------|----------|------|
++| `powerPred`（实测口径） | `SetMotorData()` 喂进来的**实测**转矩 | RLS 拟合、上报观测 |
++| `powerCmd`（指令口径） | `SetTarget()` 喂进来的 **PID 目标电流** × torqueK | **限幅判决**、分配权重 |
++
++限幅判决必须用指令口径：按实测口径判决等于"等电流真的上去才知道超了"，
++过载已经放出去好几拍，阶跃 / 堵转时根本限不住。因此调用顺序是
++`SetMotorData()` → `SetTarget()` → `Predict()` → `Allocate()`。
+ 
+ ## 管线
+ 
+ ```
+ 每个控制周期 (1ms)
+ 
+-① SetMotorData(i, current, velocity, pidErr)
+-   ├── τ = current × torqueK
+-   ├── ω = velocity / 9.55      (RPM → rad/s)
+-   ├── τ², ω² 缓存
++① SetMotorData(i, torque, omega, pidErr)
++   ├── τ = torque（实测转矩）
++   ├── ω = omega (rad/s)
++   ├── τ², ω², τ·ω 缓存
+    └── pidErr 缓存（隶属度计算用）
+ 
+-② Predict()
+-   ├── P_pred[i] = K1·τ² + K2·ω² + τ·ω + K3
+-   ├── Στ², Σω²
+-   └── RLS Update(α=[Στ², Σω²], β=P_meas - K3)
+-       └── 更新 K1、K2
++② SetTarget(i, targetCurrent)        → PID 目标电流
++
++③ Predict()
++   ├── P_pred[i] = K1·τ² + K2·ω² + η·τ·ω + K3              （实测口径）
++   ├── P_cmd[i]  = K1·τc² + K2·ω² + η·τc·ω + K3, τc = 目标电流×torqueK（指令口径）
++   ├── Στ², Σω², Στω
++   └── 仅在 SetMeasuredPower(p, true) 标记过新样本时：
++       RLS Update(α=[Στ², Σω²], β=P_meas - ΣK3 - η·Στω)
++       └── 更新 K1、K2（钳在 [k1Min,k1Max]×[k2Min,k2Max] 内）
+ 
+-③ Allocate(budget)
++④ Allocate(budget)
+    ├── 权重 K = 误差水平插值 (errLower~errUpper)
+-   ├── membership[i] = K·|err|/Σ|err| + (1-K)·|P_pred|/Σ|P_pred|
++   ├── share[i] = K·|err|/Σ|err| + (1-K)·P_cmd⁺/ΣP_cmd⁺   （只统计耗电部分）
++   ├── membership[i] = minShare + (1-ΣminShare)·share[i]/Σshare（Σ = 1）
+    ├── powerLimit[i] = membership[i] × budget
+-   ├── ΣP_pred ≤ budget → 电流直通
+-   └── ΣP_pred > budget → 解 K1·τ² + ω·τ + (K2·ω² + K3 - P_limit) = 0
+-
+-④ GetLimitedCurrent(i) → 功率限制后的电流值
++   ├── ΣP_cmd ≤ budget **且** ΣP_pred ≤ budget → 电流直通
++   └── 任一超过 → 解 K1·τ² + η·ω·τ + (K2·ω² + K3 - P_limit) = 0 得 τ_lim，
++       再按比例缩放 PID 输出：scale = min(|τ_lim|/|τ_target|, |τ_lim|/|τ_meas|)
++   ├── 两个比例分别对应"阶跃预判（指令口径）"和"电调电流环增益误差纠偏（实测口径）"
++   ├── τ_lim 与目标反号 → scale = 0（无同号可行解，不能出力）
++   └── scale 钳在 [0,1]（只削不加，且符号天然跟目标一致）
++   └── LimitRegen()：制动倒灌总功率 > regenMaxW 时，把所有**制动中**的电机按比例削
++ 
++⑤ GetLimitedCurrent(i) → 功率限制后的电流值
+ ```
+ 
++> **回馈上限（regenMaxW）**：制动象限的机械功率是往母线倒灌的（实车实测峰值
++> 83.6 W、母线电压被抬高 0.61 V）。倒灌不违反"输入功率 ≤ 预算"，但会把母线电压
++> 顶高 —— 电池满电或连续急刹时可能超出器件耐压。`regenMaxW > 0` 时对倒灌总功率
++> 做统一缩放，驱动中的电机不受影响。判定取命令口径与实测口径里更狠的那个
++> （电调电流环增益误差会让实测大于命令）。默认 0 = 不限制。
++
++> **为什么按比例缩放而不是直接把解出来的电流当命令**：电调的电流环有增益误差
++> （实车实测：命令 0.46 A → 电调实际 0.62 A，×1.35）。直接把解出来的电流当命令会
++> 让实际功率超出份额（实测偏差 +40%）；按"实测转矩→允许转矩"的比值缩放，增益误差
++> 在同一域里自动抵消，实际功率能正好落在份额上。
++
+ ## 使用方式
+ 
+ ### 实例化
+@@ -72,6 +112,7 @@ alg::power_ctrl::PowerCtrl<2> ctrl({
+     1.453e-7f,      // k1Init
+     1.453e-7f,      // k2Init
+     3.0f,           // k3
++    1.0f,           // etaInit（τ·ω 系数）
+     50.0f,          // errUpper
+     0.01f,          // errLower
+     0.99999f,       // rlsLambda
+@@ -87,13 +128,24 @@ alg::power_ctrl::PowerCtrl<2> ctrl({
+ | k1Init | 1.453e-7 | 铜损系数 K1 初始值 |
+ | k2Init | 1.453e-7 | 铁损系数 K2 初始值 |
+ | k3 | 3.0 | 常数损耗（W），从 RLS 目标中减掉 |
++| etaInit | 1.0 | τ·ω 系数 η：1 = 理想机械功率，可按传动效率标定 |
+ | errUpper | 50.0 | 隶属度上限阈值（|err| ≥ 此值时全按需求分配） |
+ | errLower | 0.01 | 隶属度下限阈值（|err| ≤ 此值时全按功率分配） |
+ | rlsLambda | 0.99999 | RLS 遗忘因子 |
+ | rlsEnable | false | RLS 在线辨识开关 |
++| tauOmegaEnable | true | 是否包含 η·τ·ω 项（关掉后预测与求解都不含它） |
++| pInit | 1e-5 | RLS 协方差初值 |
++| k1Min / k1Max | 0 / 1e4 | K1 辨识结果钳位范围（负值一律不允许） |
++| k2Min / k2Max | 0 / 1e4 | K2 辨识结果钳位范围 |
++| minBudgetShare | 0.0 | 每台电机的最低预算份额（0~1/N），防某台被分到 0 预算后被迫退出驱动 |
++| regenMaxW | 0.0 | 回馈（制动倒灌）功率上限 W，<=0 不限制 |
+ 
+ 注意：`motorCount` 不由 Config 设置，而是通过模板参数 `PowerCtrl<kMotorCount>` 在编译期确定。
+ 
++注意：`rlsLambda` 与 `SetMeasuredPower()` 的调用频率耦合 —— RLS 每次**新样本**迭代
++一次，所以遗忘时间常数 ≈ `1 / ((1-λ)·功率计帧率)`。底盘 1 kHz 控制、功率计 100 Hz
++时，λ = 0.999 对应约 10 s 记忆；想更快跟随就把 λ 调小，但不要小到开始追噪声。
++
+ ### 控制循环
+ 
+ ```cpp
+@@ -149,20 +201,28 @@ K1/K2 会从初始值逐渐收敛到真实值。收敛速度取决于 λ 和激
+            │                  │
+            │  P_pred = K1·τ² │
+            │        + K2·ω²  │
+-           │        + τ·ω    │
++           │        + η·τ·ω  │
+            │        + K3     │
+            │                  │
+            │  x = [Στ², Σω²] │
+-           │  y = P_meas-K3  │
++           │  y = P_meas     │
++           │    - ΣK3 - ηΣτω │
+            │       ↓         │
+            │  RLS.Update(x,y)│
+            │  K1=w[0], K2=w[1]│
+            └─────────────────┘
+ ```
+ 
+-### 为什么减去 K3
++### 为什么减去 K3 和 η·τ·ω
+ 
+-RLS 建模的是 `K1·τ² + K2·ω² = P_meas - K3 - τ·ω`。如果不减 K3，K3 作为常数偏置会吸收到 K1 或 K2 中，导致参数偏移。剩下 `τ·ω` 是真实的机械功率，不应被 RLS 吃掉，所以保留在残差中。
++RLS 建模的是 `K1·τ² + K2·ω² = P_meas - ΣK3 - η·Στω`。
++
++- K3 是每台电机各一份的固定损耗（总线上的实测总功率里含 `kMotorCount` 份），
++  只减一份会让 K1/K2 整体偏高一个常数偏置；
++- `η·τ·ω` 是真实的机械功率，必须显式减掉。若留在拟合目标里，K1/K2 会把它
++  平均吸收进去，而 `Predict()` 的单机预测又会再加一次 `η·τ·ω`，等于重复计入。
++
++两个量都是已知的，留在辨识里只会污染 K1、K2 的物理含义。
+ 
+ ### 激励条件
+ 
+@@ -175,10 +235,26 @@ RLS 需要 **持续激励** 才能收敛。具体来说，输入向量 `α = [τ
+ 
+ ## 关键边界条件
+ 
+-- **不超限**：总预测功率未超过预算时，电流直通，不做限制
+-- **超限求解**：对每个电机解 `K1·τ² + ω·τ + (K2·ω² + K3 - P_limit) = 0`，选择与原始力矩同号的根
++- **不超限**：总**指令**功率未超过预算时，电流直通，不做限制
++- **超限求解**：对每个电机解 `K1·τ² + η·ω·τ + (K2·ω² + K3 - P_limit) = 0`，
++  取目标同侧的根；`K1 ≈ 0`（未标定）时退化成一次方程 `η·ω·τ + (K2·ω² + K3 - P_limit) = 0`
++- **同号钳位**：解出的限幅值若与目标电流反号，一律输出 0 —— 预算不够时方程的两个根
++  可能全在目标反侧（例如 ω>0 且份额小于 `K2·ω²+K3`），照抄会变成"PID 要正电流、
++  限幅给负电流"的反向驱动
++- **只削不加**：限幅结果的幅值超过目标时回退到目标，限幅不会主动加大输出
++- **预算份额归一**：`Σmembership = 1`，即 `ΣpowerLimit = budget`；`minBudgetShare > 0`
++  时每台至少拿到该份额（否则误差恰为 0 的轮子份额为 0，超限时只能退出驱动）
++- **回馈制动**：`P_cmd ≤ 0` 的电机不参与"耗电份额"统计，不会因为发电反而分到更多预算
+ - **index 越界**：SetMotorData 和 GetLimitedCurrent 静默返回
+ - **delta < 0**：二次方程判别式负数时归零
++- **NaN / Inf**：实测功率、回归向量、参数、输出任一环节出现非有限值都会被丢弃或钳位，
++  不会扩散成 NaN 电流指令
++
++> 注意：**预算低于空载损耗时无法靠限流守住总功率**。某台电机在转速 ω 下的空载损耗
++> 是 `K2·ω² + K3`，只要它还在转就一定会消耗这么多，限流最多把电流压到 0。
++> 例如 `K2 = 5.2e-3`、`K3 = 3` 时，ω = 40 rad/s 的单台空载损耗就是 11.3 W，
++> 四台 45 W —— 正好等于预算。所以功率超标排查时，先确认 `K2 / K3` 是否被过拟合，
++> 以及预算是否大于"目标转速下的空载损耗总和"。
+ 
+ ## 典型配置示例
+ 
+@@ -201,7 +277,7 @@ ctrl.Predict();
+ 
+ ```cpp
+ alg::power_ctrl::PowerCtrl<4> chassisCtrl({
+-    4.577e-5f, 1.453e-7f, 1.453e-7f, 3.5f,
++    4.577e-5f, 1.453e-7f, 1.453e-7f, 3.5f, 1.0f,
+     0.001f, 500.0f, 0.99999f, false   // 不开启 RLS，用固定 K1/K2
+ });
+ 
+diff --git a/controller/power_ctrl/power_ctrl.hpp b/controller/power_ctrl/power_ctrl.hpp
+index 51ebfe0..2f41847 100644
+--- a/controller/power_ctrl/power_ctrl.hpp
++++ b/controller/power_ctrl/power_ctrl.hpp
+@@ -2,8 +2,8 @@
+  * @file power_ctrl.hpp
+  * @author qingyu
+  * @brief 电机功率控制器 — 模型预测 / RLS 在线辨识 / 隶属度分配 / 力矩限幅
+- * @version 0.2
+- * @date 2026-06-27
++ * @version 0.3
++ * @date 2026-10-15
+  */
+ 
+ #pragma once
+@@ -12,19 +12,35 @@
+ 
+ #include <stdint.h>
+ #include <math.h>
++#include <cmath>
+ #include "rls.hpp"
+ 
+ namespace alg::power_ctrl {
+ 
++/// 二次方程一次项 (A) 绝对值小于该值时按退化的一次方程处理
++constexpr float kQuadraticATiny = 1.0e-9f;
++
++/// 一次方程斜率 (B) 绝对值小于该值：方程与 τ 无关，解不存在
++constexpr float kQuadraticBTiny = 1.0e-12f;
++
++/// 限幅比例系数的分母下限：目标/实测转矩小于它就不参与"按比例缩放"
++/// （≈0.07 A，低于此认为这一路没在出力，没必要削）
++constexpr float kTorqueFloor = 0.02f;
++
++/// 有限性判据：NaN / Inf 一律视为无效数据
++inline bool IsFinite(float v) { return std::isfinite(v); }
++
+ /**
+  * @brief  单电机状态
+  */
+ struct MotorState {
+-    float torque        = 0.0f;         // τ = current × torqueK
++    float torque        = 0.0f;         // τ = current × torqueK（实测口径）
+     float omega         = 0.0f;         // ω = rpm / 9.55 (rad/s)
+     float torque2       = 0.0f;         // τ²
+     float omega2        = 0.0f;         // ω²
+-    float powerPred     = 0.0f;         // P_in = K1·τ² + K2·ω² + τ·ω + K3
++    float torqueOmega   = 0.0f;         // τ·ω
++    float powerPred     = 0.0f;         // 实测口径预测 P_in = K1·τ² + K2·ω² + η·τ·ω + K3
++    float powerCmd      = 0.0f;         // 指令口径预测（代入 PID 目标电流，限幅判决用）
+     float pidErr        = 0.0f;         // PID 误差（隶属度计算用）
+     float powerLimit    = 0.0f;         // 该电机分配的功率预算
+     float targetCurrent = 0.0f;         // PID 目标电流（串级输入）
+@@ -37,29 +53,66 @@ struct MotorState {
+  * @tparam kMotorCount  电机数量（编译期分配）
+  *
+  * @par 管线（每控制周期调用一次）：
+- *       @n 1. SetMotorData(i, current, velocity, pidErr)   — 喂入各电机数据
+- *       @n 2. Predict()                                    — 功率预测 + RLS
+- *       @n 3. Allocate(totalBudget)                        — 隶属度分配 + 限幅
+- *       @n 4. GetLimitedCurrent(i)                         — 读取结果
++ *       @n 1. SetMotorData(i, torque, omega, pidErr)       — 喂入实测转矩/角速度
++ *       @n 2. SetTarget(i, targetCurrent)                  — 喂入 PID 目标电流
++ *       @n 3. Predict()                                    — 功率预测 + RLS
++ *       @n 4. Allocate(totalBudget)                        — 隶属度分配 + 限幅
++ *       @n 5. GetLimitedCurrent(i)                         — 读取结果
++ *
++ * @par 两套功率口径（关键）：
++ *       · powerPred：把**实测**转矩代进模型 → 反映"现在实际用了多少"，
++ *         只用于 RLS 拟合与上报；
++ *       · powerCmd ：把 **PID 目标电流**代进同一组系数 → 反映"这一拍要下多少"，
++ *         限幅判决必须用它。用实测口径判决要等电流真的上去才知道超了，
++ *         阶跃 / 堵转时慢一拍，限不住。
++ *       由于 powerCmd 在 Predict() 里算，调用顺序必须是 SetTarget() → Predict()。
+  *
+  * @par RLS：
+  *       在线辨识 K1（铜损系数）和 K2（铁损系数）。
+- *       K3 为固定常数损耗，不参与辨识。
++ *       K3 与 η·τ·ω 为已知项，从拟合目标中减掉，不参与辨识。
++ *       辨识结果被钳在 [k1Min, k1Max] × [k2Min, k2Max] 内：参数一旦为负，
++ *       预测功率会变成负值，限幅会以为"没超预算"而对所有电机直通。
+  */
+ template <uint8_t kMotorCount>
+ class PowerCtrl final
+ {
+ public:
++    /**
++     * @brief 配置参数
++     *
++     * @note k1Init / k2Init 必须按**同一套单位**标定，且 K1 不能留默认值：
++     *       K1·τ² 是铜损项，物理上 K1 ≈ R / Kt²（R = 相电阻 Ω，Kt = 转矩常数
++     *       N·m/A）。以 M3508（Kt = 0.3）为例 K1 应在 1~2 量级；若沿用库默认的
++     *       1.453e-7，铜损项实际等于 0，模型只剩 η·τ·ω + K3 —— 低速 / 堵转
++     *       （ω→0 且电流很大）时预测功率仍远低于预算，限幅会完全不起作用。
++     */
+     struct Config {
+         float   torqueK    = 4.577e-5f;         // 电流 → 转矩（M3508 常数）
+-        float   k1Init     = 1.453e-7f;         // RLS 初始 K1（铜损系数）
++        float   k1Init     = 1.453e-7f;         // RLS 初始 K1（铜损系数），见上方 note
+         float   k2Init     = 1.453e-7f;         // RLS 初始 K2（铁损系数）
+         float   k3         = 3.0f;              // 固定常数损耗
++        float   etaInit    = 1.0f;              // τ·ω 系数
+         float   errUpper   = 50.0f;             // 隶属度：全需求阈值
+         float   errLower   = 0.01f;             // 隶属度：全功率阈值
+         float   rlsLambda  = 0.99999f;          // RLS 遗忘因子
+         bool    rlsEnable  = false;             // false = 使用固定 K1/K2
+         bool    tauOmegaEnable = true;          // 是否包含 τ·ω 项
++        /// 机械功率项是否取绝对值（默认 false = 保留符号，允许回馈）。
++        ///
++        /// 实车实测：刹车时底盘支路电流为**负**（−0.79 A @24.9 V ≈ 回馈 19 W），
++        /// 也就是能量回到母线/电容、由裁判系统的缓冲吸收 —— 和 RM 的缓冲模型一致，
++        /// 所以默认按有符号处理（＝HKUST 那套 τ·ω 系数为 1 的形式）。
++        /// 仅当确认电调把制动能量全烧在桥里（母线电流始终为正）时才设 true。
++        bool    mechAbs = false;
++        /// 回馈（制动倒灌）功率上限 W，<= 0 表示不限制。
++        float   regenMaxW = 0.0f;
++        
++        float   pInit      = 1.0e-5f;           // RLS 协方差初值
++        float   k1Min      = 0.0f;              // 辨识结果下界（负值一律不允许）
++        float   k1Max      = 1.0e4f;            // 辨识结果上界
++        float   k2Min      = 0.0f;
++        float   k2Max      = 1.0e4f;
++        float   minBudgetShare = 0.0f;          // 每台电机的最低预算份额（0~1/N）
+     };
+ 
+     PowerCtrl() : PowerCtrl(Config{}) {}
+@@ -70,9 +123,10 @@ public:
+      */
+     explicit PowerCtrl(const Config& cfg)
+         : cfg_(cfg)
+-        , k1_(cfg.k1Init)
+-        , k2_(cfg.k2Init)
+-        , rls_(cfg.rlsLambda, 1e-5f)
++        , k1_(ClampParam(cfg.k1Init, cfg.k1Min, cfg.k1Max))
++        , k2_(ClampParam(cfg.k2Init, cfg.k2Min, cfg.k2Max))
++        , eta_(cfg.etaInit)
++        , rls_(cfg.rlsLambda, cfg.pInit)
+     {
+         rlsInited_ = cfg.rlsEnable;
+ 
+@@ -89,10 +143,13 @@ public:
+     void Init(const Config& cfg)
+     {
+         cfg_ = cfg;
+-        k1_  = cfg.k1Init;
+-        k2_  = cfg.k2Init;
++        k1_  = ClampParam(cfg.k1Init, cfg.k1Min, cfg.k1Max);
++        k2_  = ClampParam(cfg.k2Init, cfg.k2Min, cfg.k2Max);
++        eta_ = cfg.etaInit;
+         rlsInited_ = cfg.rlsEnable;
+ 
++        // 协方差一并归零重来：上次运行留下的 P 对新的权重初值没有意义
++        rls_.Reset(cfg.pInit);
+         if (rlsInited_) {
+             float w[2] = { k1_, k2_ };
+             rls_.SetWeights(w);
+@@ -102,6 +159,7 @@ public:
+         for (auto& m : membership_) m = 0.0f;
+ 
+         measuredPower_ = 0.0f;
++        measuredFresh_ = false;
+     }
+ 
+     /**
+@@ -120,6 +178,7 @@ public:
+         m.omega    = omega;
+         m.torque2  = m.torque * m.torque;
+         m.omega2   = m.omega  * m.omega;
++        m.torqueOmega = m.torque * m.omega;
+         m.pidErr   = pidErr;
+     }
+ 
+@@ -134,59 +193,132 @@ public:
+         motors_[idx].targetCurrent = current;
+     }
+ 
+-    void SetMeasuredPower(float power) { measuredPower_ = power; }
++    /**
++     * @brief 更新实测总功率
++     * @param power 母线实测功率 (W)
++     * @param fresh true = 该值是功率计**新帧**带来的；false = 只是缓存刷新
++     *
++     * @note 控制周期通常快于功率计帧率（底盘 1ms，功率计常见 100~1000Hz）。
++     *       把同一条测量值重复喂进 RLS 会让拟合被系统性带偏（x 每拍都在变、
++     *       y 却是旧的），所以只有 fresh = true 的那一拍才真正迭代。
++     */
++    void SetMeasuredPower(float power, bool fresh = true)
++    {
++        measuredPower_ = power;
++        if (fresh) measuredFresh_ = true;
++    }
++
++    /// @brief 在线辨识开关：关掉后权重保留，只停用实测功率更新
++    /// @note 开关状态发生变化时会复位协方差，避免用膨胀过的 P 继续迭代；
++    ///       调用方应把"功率计是否可用"做成带滞回的判断，别每拍翻转。
++    void EnableRls(bool on)
++    {
++        if (on == rlsInited_) return;
++
++        rlsInited_ = on;
++        float w[2] = { k1_, k2_ };
++        rls_.Reset(cfg_.pInit);
++        rls_.SetWeights(w);
++    }
++
++    /**
++     * @brief 清空辨识状态，保留当前 K1/K2 作为新初值
++     * @note 停机 / 复位 / 工况被打断时调用，让 RLS 从干净状态重新收敛
++     */
++    void ResetIdent()
++    {
++        float w[2] = { k1_, k2_ };
++        rls_.Reset(cfg_.pInit);
++        rls_.SetWeights(w);
++        measuredFresh_ = false;
++    }
+ 
+     /**
+      * @brief 功率预测 + RLS 在线更新
+      *
+-     * 对每台电机计算 P = K1·τ² + K2·ω² + τ·ω(可选) + K3，
+-     * 再以 Στ²、Σω² 为输入，P_meas - K3 为期望输出，
+-     * 更新 K1（铜损系数）和 K2（铁损系数）。
++     * 同一组系数算两遍：实测口径 powerPred（RLS 拟合 / 上报）与
++     * 指令口径 powerCmd（把目标电流代进去，限幅判决用）。
++     *
++     * 拟合目标 y = P_meas - ΣK3 - η·Στω，更新 K1、K2。
++     * 只有 SetMeasuredPower(..., true) 标记过的新样本才迭代 RLS。
+      */
+     void Predict()
+     {
+-        float sumTorque2 = 0.0f;
+-        float sumOmega2  = 0.0f;
++        float sumTorque2  = 0.0f;
++        float sumOmega2   = 0.0f;
++        float sumMech     = 0.0f;       // Σ(η·τ·ω)，已按 mechNoRegen 钳过
+ 
+         for (uint8_t i = 0; i < kMotorCount; i++)
+         {
+             auto& m = motors_[i];
+-
+-            // P = K1·τ² + K2·ω² + τ·ω(可选) + K3
+-            m.powerPred = k1_ * m.torque2 + k2_ * m.omega2 + cfg_.k3;
+-            if (cfg_.tauOmegaEnable) {
+-                m.powerPred += m.torque * m.omega;
++            const float tauCmd = m.targetCurrent * cfg_.torqueK;
++
++            // 机械功率项 η·τ·ω，取绝对值（mechAbs）。实车实测：4 轮 8A 猛刹车时
++            // 母线功率冲到 70 W（功率计从不出现负值），按"回馈"算只有 28 W ——
++            // 差额 40 W 会让限幅对制动完全放行。取绝对值后制动也按耗电计入。
++            float mechMeas = cfg_.tauOmegaEnable ? (eta_ * m.torqueOmega) : 0.0f;
++            float mechCmd  = cfg_.tauOmegaEnable ? (eta_ * tauCmd * m.omega) : 0.0f;
++            if (cfg_.mechAbs) {
++                mechMeas = fabsf(mechMeas);
++                mechCmd  = fabsf(mechCmd);
+             }
+ 
++            // 实测口径：P = K1·τ² + K2·ω² + η·τ·ω(可选, 钳过) + K3
++            m.powerPred = k1_ * m.torque2 + k2_ * m.omega2 + cfg_.k3 + mechMeas;
++
++            // 指令口径：同样的系数，转矩换成"这一拍打算下发的"目标电流。
++            // 限幅必须按它判决 —— 按实测口径判决等于"等超了才知道超了"。
++            m.powerCmd = k1_ * tauCmd * tauCmd + k2_ * m.omega2 + cfg_.k3 + mechCmd;
++
+             sumTorque2 += m.torque2;
+             sumOmega2  += m.omega2;
++            sumMech    += mechMeas;
+         }
+ 
+-        // RLS 在线更新 — 减掉已知的 K3，RLS 只管 K1·τ² + K2·ω²
+-        if (rlsInited_)
++        // RLS：已知项（ΣK3、Ση·τω，都是钳位后的）先减掉
++        if (rlsInited_ && measuredFresh_)
+         {
+-            float x[2] = { sumTorque2, sumOmega2 };
+-            rls_.Update(x, measuredPower_ - cfg_.k3);
+-            k1_ = rls_.GetWeights()[0];
+-            k2_ = rls_.GetWeights()[1];
++            measuredFresh_ = false;
++
++            float y = measuredPower_ - static_cast<float>(kMotorCount) * cfg_.k3 - sumMech;
++
++            const float x[2] = { sumTorque2, sumOmega2 };
++            rls_.Update(x, y);
++
++            // 钳位后写回 RLS：让滤波器内部状态与对外发布的权重保持一致。
++            // 参数跑成负值时预测功率为负 → 判决以为没超预算 → 限幅静默失效。
++            k1_ = ClampParam(rls_.GetWeights()[0], cfg_.k1Min, cfg_.k1Max, k1_);
++            k2_ = ClampParam(rls_.GetWeights()[1], cfg_.k2Min, cfg_.k2Max, k2_);
++
++            float w[2] = { k1_, k2_ };
++            rls_.SetWeights(w);
+         }
+     }
+ 
+     /**
+      * @brief 功率分配：隶属度计算 + 力矩限幅
+      *
+-     * 总预测未超预算时直通 PID 目标电流；
+-     * 超限时逐电机解二次方程求受限转矩。
++     * 判决口径是**指令功率**（powerCmd）：要等电流真的上去才发现超预算，
++     * 过载那几拍就已经放出去了，所以不能用实测口径。
++     *
++     * 总指令预测未超预算时直通 PID 目标电流；
++     * 超限时按每台的预算份额解二次方程求受限转矩。
++     *
+      * @param totalBudget 该组总功率预算 (W)
++     * @note 调用前需先 SetTarget() → Predict()
+      */
+     void Allocate(float totalBudget)
+     {
+         float sumAbsErr   = 0.0f;
+-        float sumPowerAbs = 0.0f;
++        float sumPowerPos = 0.0f;
+ 
+         for (uint8_t i = 0; i < kMotorCount; i++) {
+-            sumAbsErr   += fabsf(motors_[i].pidErr);
+-            sumPowerAbs += fabsf(motors_[i].powerPred);
++            sumAbsErr += fabsf(motors_[i].pidErr);
++
++            // 只统计"耗电"的部分：回馈制动（τ·ω < 0）是在往回灌能量，
++            // 用 |P| 参与分配会让正在发电的电机反而分到更多预算。
++            const float p = motors_[i].powerCmd;
++            if (p > 0.0f) sumPowerPos += p;
+         }
+ 
+         // 权重 K（误差水平插值）
+@@ -200,45 +332,141 @@ public:
+             k = (sumAbsErr - cfg_.errLower) / (range > 0.0f ? range : 1.0f);
+         }
+ 
+-        // 隶属度 + 功率上限
+-        for (uint8_t i = 0; i < kMotorCount; i++)
+-        {
+-            float ratioErr   = (sumAbsErr   > 0.0f) ? fabsf(motors_[i].pidErr)     / sumAbsErr   : 0.0f;
+-            float ratioPower = (sumPowerAbs > 0.0f) ? fabsf(motors_[i].powerPred)  / sumPowerAbs : 0.0f;
++        // 保底份额：不允许任何一台拿到 0 预算。份额为 0 的电机在超限时解不出
++        // 与自己同号的根，只能被迫退出驱动，表现成"直线跑着突然丢一个轮子"。
++        float shareFloor = cfg_.minBudgetShare;
++        if (shareFloor < 0.0f) shareFloor = 0.0f;
+ 
+-            membership_[i] = k * ratioErr + (1.0f - k) * ratioPower;
++        const float shareCeil = 1.0f / static_cast<float>(kMotorCount);
++        if (shareFloor >= shareCeil) shareFloor = 0.0f;             // 配不出来就别配
++        const float shareFree = 1.0f - shareFloor * static_cast<float>(kMotorCount);
+ 
+-            if (membership_[i] < 0.0f) membership_[i] = 0.0f;
+-            if (membership_[i] > 1.0f) membership_[i] = 1.0f;
++        // 原始份额 → 归一化 → 加保底，保证 Σmembership = 1（即 ΣpowerLimit = 预算）
++        float share[kMotorCount] {};
++        float sumShare = 0.0f;
+ 
+-            motors_[i].powerLimit = membership_[i] * totalBudget;
++        for (uint8_t i = 0; i < kMotorCount; i++)
++        {
++            const float ratioErr = (sumAbsErr > 0.0f)
++                                 ? fabsf(motors_[i].pidErr) / sumAbsErr : 0.0f;
++            const float p = motors_[i].powerCmd;
++            const float ratioPower = (sumPowerPos > 0.0f)
++                                   ? ((p > 0.0f) ? p / sumPowerPos : 0.0f) : shareCeil;
++
++            float s = k * ratioErr + (1.0f - k) * ratioPower;
++            if (!IsFinite(s) || s < 0.0f) s = 0.0f;
++            if (s > 1.0f) s = 1.0f;
++
++            share[i] = s;
++            sumShare += s;
+         }
+ 
+-        // 受限力矩求解
+-        float totalPred = GetTotalPower();
++        for (uint8_t i = 0; i < kMotorCount; i++)
++        {
++            const float norm = (sumShare > 0.0f) ? (share[i] / sumShare) : shareCeil;
++            membership_[i] = shareFloor + shareFree * norm;
++            motors_[i].powerLimit = membership_[i] * totalBudget;
++        }
+ 
+-        if (totalPred <= totalBudget) {
++        // 受限力矩求解：两个口径都要看。
++        // 指令口径负责"预判"（阶跃给上去时立刻出手，不用等实测电流爬到），
++        // 实测口径负责"纠偏"（电调电流环有增益误差：实测 0.62A 对应命令 0.46A，
++        // 只看命令口径会低估 10%+ 的功率）。任一超预算就进入限幅。
++        if (GetTotalPowerCmd() <= totalBudget && GetTotalPower() <= totalBudget) {
+             // 未超限：透传 PID 目标电流
+             for (uint8_t i = 0; i < kMotorCount; i++) {
+                 motors_[i].currentOut = motors_[i].targetCurrent;
+             }
+-            return;
+         }
+-
++        else
++        {
+         // 超限：逐电机解方程，限制 PID 目标
+         for (uint8_t i = 0; i < kMotorCount; i++)
+         {
+-            const auto& m = motors_[i];
++            auto& m = motors_[i];
+ 
+-            float a = k1_;                                          // K1
+-            float b = m.omega;                                      // ω
+-            float c = k2_ * m.omega2 + cfg_.k3 - m.powerLimit;      // K2·ω² + K3 - P_limit
++            const float a = k1_;                                        // K1
++            float b = cfg_.tauOmegaEnable ? (eta_ * m.omega) : 0.0f;    // η·ω
+ 
+-            bool positive = (m.targetCurrent >= 0.0f);
+-            float limitedTorque = SolveTorque(a, b, c, positive);
++            // 制动象限也要用"同一套模型"：mechAbs 打开时制动按 |τ·ω| 计耗电，
++            // 功率 = K1·τ² + K2·ω² + K3 - η·ω·τ（τ 与 ω 反号时 |τω| = -τω），
++            // 所以一次项系数要取负。若沿用 +η·ω，二次方程会认为"刹车越大越省功率"，
++            // 解出来的受限转矩比目标还大，再被"只削不加"退回目标 → 制动完全不限幅。
++            if (cfg_.mechAbs && (m.targetCurrent * m.omega) < 0.0f) {
++                b = -b;
++            }
++            const float c = k2_ * m.omega2 + cfg_.k3 - m.powerLimit;    // K2·ω² + K3 - P_limit
++
++            const bool positive = (m.targetCurrent >= 0.0f);
++            const float limitedTorque = SolveTorque(a, b, c, positive);
++
++            // 限幅做成"按比例缩放 PID 输出"，比例取两个口径里更狠的那个：
++            //   ① 指令口径：允许转矩 / 目标转矩 —— 阶跃时预判用
++            //   ② 实测口径：允许转矩 / 实测转矩 —— 电调实际电流比命令大时纠偏用
++            // 用比值而不是直接把解出来的电流当命令，好处是电调电流环的增益误差
++            // 自动抵消（两边都在同一个"实际"域里比）。
++            float scale = 1.0f;
++
++            const float targetTorque = m.targetCurrent * cfg_.torqueK;
++            if (targetTorque * limitedTorque <= 0.0f) {
++                // 无同号可行解（例如份额为 0、ω>0 时两根本全负）→ 这一路不能出力。
++                // 必须归零：按幅值缩放会把反号的根变成"大幅削减的正向电流"，
++                // 反而给出一个超出份额的正输出。
++                scale = 0.0f;
++            } else if (fabsf(targetTorque) > kTorqueFloor) {
++                const float s = fabsf(limitedTorque) / fabsf(targetTorque);
++                if (s < scale) scale = s;
++            }
++            // 实测口径：只在实测与目标同号时才用它纠偏（异号说明这一路正在换向，
++            // 此刻没在往目标方向耗电，不需要削）
++            if ((m.torque * m.targetCurrent) > 0.0f && fabsf(m.torque) > kTorqueFloor) {
++                const float s = fabsf(limitedTorque) / fabsf(m.torque);
++                if (s < scale) scale = s;
++            }
++
++            if (!IsFinite(scale) || scale < 0.0f) scale = 0.0f;
++            if (scale > 1.0f) scale = 1.0f;             // 只削不加
++
++            // 按比例缩放：符号天然跟 PID 目标一致（不会出现反向驱动），
++            // 目标为 0 时输出 0
++            const float out = m.targetCurrent * scale;
++            m.currentOut = IsFinite(out) ? out : 0.0f;
++        }
++        }   // else（超限路径）
++
++        LimitRegen();
++    }
++
++    /**
++     * @brief 回馈（制动倒灌）功率上限
++     *
++     * 只统计制动象限（τ·ω < 0）往母线倒灌的那部分，超过 regenMaxW 就把**制动中的**
++     * 电机按同一比例削小；驱动中的电机不动（回馈上限不该影响加速）。
++     *
++     * 判定取"命令口径"和"实测口径"里更狠的那个：电调电流环有增益误差（实测可能是
++     * 命令的 1.3~1.4 倍），只看命令口径会低估真实倒灌功率、保护不到位。
++     */
++    void LimitRegen()
++    {
++        if (cfg_.regenMaxW <= 0.0f) return;
++
++        float mech[kMotorCount] {};
++        float regen = 0.0f;
++
++        for (uint8_t i = 0; i < kMotorCount; i++) {
++            const float mechCmd  = motors_[i].currentOut * cfg_.torqueK * motors_[i].omega;
++            const float mechMeas = motors_[i].torque * motors_[i].omega;
++            mech[i] = fminf(mechCmd, mechMeas);          // 更负的那个 = 倒灌更多
++            if (mech[i] < 0.0f) regen += -mech[i];
++        }
++
++        if (regen <= cfg_.regenMaxW) return;
+ 
+-            float limitedCurrent = limitedTorque / cfg_.torqueK;
+-            motors_[i].currentOut = (fabsf(m.targetCurrent) <= fabsf(limitedCurrent)) ? m.targetCurrent : limitedCurrent;
++        const float scale = cfg_.regenMaxW / regen;
++        for (uint8_t i = 0; i < kMotorCount; i++) {
++            if (mech[i] < 0.0f) {
++                motors_[i].currentOut *= scale;
++            }
+         }
+     }
+ 
+@@ -253,7 +481,7 @@ public:
+     }
+ 
+     /**
+-     * @brief 所有电机总预测功率
++     * @brief 所有电机总预测功率（实测口径：现在实际用了多少）
+      * @return 总功率 (W)
+      */
+     float GetTotalPower() const
+@@ -265,14 +493,47 @@ public:
+         return sum;
+     }
+ 
++    /**
++     * @brief 所有电机总指令功率（判决口径：这一拍要下多少）
++     * @return 总功率 (W)，与 Allocate() 的判决量一致
++     */
++    float GetTotalPowerCmd() const
++    {
++        float sum = 0.0f;
++        for (uint8_t i = 0; i < kMotorCount; i++) {
++            sum += motors_[i].powerCmd;
++        }
++        return sum;
++    }
++
++    /// @brief 单台电机的功率预算份额（0~1，Σ = 1）
++    float GetMembership(uint8_t idx) const
++    {
++        return (idx < kMotorCount) ? membership_[idx] : 0.0f;
++    }
++
++    /// @brief 单台电机分到的功率预算 (W)
++    float GetPowerLimit(uint8_t idx) const
++    {
++        return (idx < kMotorCount) ? motors_[idx].powerLimit : 0.0f;
++    }
++
++    /// @brief 单台电机的 PID 目标电流（限幅前），用于观测"削了多少"
++    float GetTargetCurrent(uint8_t idx) const
++    {
++        return (idx < kMotorCount) ? motors_[idx].targetCurrent : 0.0f;
++    }
++
+     float GetK1() const { return k1_; }
+     float GetK2() const { return k2_; }
++    float GetEta() const { return eta_; }
+ 
+ private:
+     Config cfg_;
+ 
+     float k1_ = 0.0f;                           // 铜损系数
+     float k2_ = 0.0f;                           // 铁损系数
++    float eta_ = 1.0f;                          // τ·ω 系数（固定）
+ 
+     MotorState motors_[kMotorCount]{};          // 各电机状态（转矩/转速/功率等）
+     float      membership_[kMotorCount]{};      // 各电机隶属度（功率分配系数 0~1）
+@@ -281,24 +542,50 @@ private:
+     bool rlsInited_ = false;
+ 
+     float measuredPower_ = 0.0f;                // 功率计实测总功率
++    bool  measuredFresh_ = false;               // 是否收到新的实测功率样本
+ 
+     /**
+-     * @brief 解二次方程 A·τ² + B·τ + C = 0，取与目标同号的根
++     * @brief 解 A·τ² + B·τ + C = 0，返回与目标同侧的受限转矩
++     *
++     * A = K1 > 0 时可行域是两根之间，取正目标的上根 / 负目标的下根。
++     * A ≈ 0（K1 未标定或为 0）时退化成一次方程 B·τ + C = 0，直接解边界；
++     * 此时模型对转矩没有二次约束能力，返回值仍然要经过调用方的同号 / 只削不加
++     * 两道钳位，才不会给出反向电流。
+      */
+     static float SolveTorque(float a, float b, float c, bool positive)
+     {
+-        if (a == 0.0f) {
+-            return (b != 0.0f) ? -c / b : 0.0f;
++        if (a <= kQuadraticATiny) {
++            return (fabsf(b) > kQuadraticBTiny) ? (-c / b) : 0.0f;
+         }
+ 
+         float delta = b * b - 4.0f * a * c;
+         if (delta < 0.0f) delta = 0.0f;
+ 
+-        float sqrtDelta = sqrtf(delta);
+-        float t1 = (-b + sqrtDelta) / (2.0f * a);
+-        float t2 = (-b - sqrtDelta) / (2.0f * a);
++        // 数值稳定写法：直接用 (-b ± √Δ) 求根，在 A 很小、B 与 √Δ 接近时
++        // 会发生灾难性相消（差值被舍入噪声吃掉），换成 q/a 与 c/q 两个根
++        const float sqrtDelta = sqrtf(delta);
++        const float q = -0.5f * (b + copysignf(sqrtDelta, b));
++
++        if (q == 0.0f) {
++            return -b / (2.0f * a);         // 重根
++        }
++
++        const float r1 = q / a;
++        const float r2 = c / q;
+ 
+-        return positive ? t1 : t2;
++        return positive ? fmaxf(r1, r2) : fminf(r1, r2);
++    }
++
++    /**
++     * @brief 参数钳位：NaN 时退回 fallback，越界时钳到 [lo, hi]
++     */
++    static float ClampParam(float v, float lo, float hi, float fallback = 0.0f)
++    {
++        if (!IsFinite(v)) return fallback;
++        if (hi < lo) { const float t = lo; lo = hi; hi = t; }
++        if (v < lo) return lo;
++        if (v > hi) return hi;
++        return v;
+     }
+ };
+ 
+diff --git a/identify/rls/rls.hpp b/identify/rls/rls.hpp
+index dcb5e30..a626d7b 100644
+--- a/identify/rls/rls.hpp
++++ b/identify/rls/rls.hpp
+@@ -41,6 +41,7 @@
+ 
+ #include <stdint.h>
+ #include <string.h>
++#include <cmath>
+ #include <Eigen/Dense>
+ 
+ namespace alg::rls {
+@@ -48,18 +49,33 @@ namespace alg::rls {
+ template <uint8_t n>
+ class RLS final
+ {
++    /// 固定尺寸 Eigen 类型：n 是编译期常量，运算全在栈上，不产生堆分配
++    using MatN = Eigen::Matrix<float, n, n>;
++    using VecN = Eigen::Matrix<float, n, 1>;
++    using RowN = Eigen::Matrix<float, 1, n>;
++
+ public:
+     /**
+      * @brief 构造 RLS 辨识器
+      * @param lambda  遗忘因子 (0 < λ ≤ 1)，越小对过去遗忘越快
+      * @param p_init  协方差矩阵 P 的初始对角值
++     * @param p_max   协方差对角上界，0 = 默认 (1e4 × p_init)
++     * @param p_min   协方差对角下界，0 = 默认 (1e-6 × p_init)
+      *
+      * @note P 初始值建议:
+      *       - SNR 较高 (信号可信): p_init = 1~10
+      *       - SNR 较低 (噪声大):   p_init = 100~1000
++     *
++     * @note p_max / p_min 是"激励不足"时的数值兜底：输入向量长期接近 0
++     *       （电机静置）时，协方差按 P ← P/λ 每拍膨胀，之后第一个有激励的
++     *       样本会拿到异常大的增益，把权重甩飞。限幅把这种"静置再激励"的
++     *       冲击限制在有界范围内。
+      */
+-    RLS(float lambda, float p_init) : lambda_(lambda)
++    RLS(float lambda, float p_init, float p_max = 0.0f, float p_min = 0.0f) : lambda_(lambda)
+     {
++        pMax_ = (p_max > 0.0f) ? p_max : (p_init * kPMaxRatio);
++        pMin_ = (p_min > 0.0f) ? p_min : (p_init * kPMinRatio);
++
+         for (uint16_t i = 0; i < n * n; i += (n + 1)) {
+             P_k[i] = p_init;
+         }
+@@ -88,17 +104,24 @@ public:
+      */
+     void Update(const float (&alpha)[n], float beta, float lambda_override = -1.0f)
+     {
++        // 输入非法（NaN / Inf）时直接丢弃本轮，保持上一轮权重
++        if (!IsFinite(beta)) return;
++        for (uint8_t i = 0; i < n; i++) {
++            if (!IsFinite(alpha[i])) return;
++        }
++
+         // 拷贝输入
+         memcpy(alpha_k, alpha, n * sizeof(float));
+         beta_k = beta;
+ 
+         // 确定本次使用的 lambda
+         float lambda = (lambda_override > 0.0f) ? lambda_override : lambda_;
++        if (lambda > 1.0f) lambda = 1.0f;
+ 
+-        // Eigen::Map 包装内部 float 数组，零拷贝
+-        Eigen::Map<Eigen::VectorXf>            x(x_k, n);       // n×1 待估参数
+-        Eigen::Map<const Eigen::RowVectorXf>   a(alpha_k, n);   // 1×n 输入行向量
+-        Eigen::Map<Eigen::MatrixXf>            P(P_k, n, n);    // n×n 协方差矩阵
++        // Eigen::Map 包装内部 float 数组，零拷贝（固定尺寸 → 不碰堆）
++        Eigen::Map<VecN>       x(x_k, n);       // n×1 待估参数
++        Eigen::Map<const RowN> a(alpha_k, n);   // 1×n 输入行向量
++        Eigen::Map<MatN>       P(P_k, n, n);    // n×n 协方差矩阵
+ 
+         // 预测 beta_hat_k = alpha_k . x_k
+         beta_hat_k = a.dot(x);
+@@ -107,17 +130,35 @@ public:
+         e_k = beta_k - beta_hat_k;
+ 
+         // 增益: K = P . alpha_kT / (lambda + alpha_k . P . alpha_kT)
+-        Eigen::VectorXf K = P * a.transpose();
++        VecN K = P * a.transpose();
+         float denom = lambda + a.dot(K);
+         if (denom < 1e-12f) denom = 1e-12f;
+         K /= denom;
+ 
+-        // 参数更新 x_k += K . e_k
+-        x += K * e_k;
++        // 参数更新 x_k += K . e_k —— 先算到临时区、确认有限后再提交，
++        // 避免更新到一半发散时权重被写坏
++        float xNew[n] {};
++        for (uint8_t i = 0; i < n; i++) {
++            xNew[i] = x_k[i] + K(i) * e_k;
++            if (!IsFinite(xNew[i])) return;
++        }
++        memcpy(x_k, xNew, sizeof(x_k));
+ 
+         // 协方差更新 P = (P - K . alpha . P) / lambda
+-        P = (P - K * a * P) / lambda;
+-        P = P.selfadjointView<Eigen::Lower>();
++        MatN Pnew = (P - K * a * P) / lambda;
++
++        // 对称化：浮点误差会让 P 逐拍失去对称性，增益方向会跟着偏
++        Pnew = ((Pnew + Pnew.transpose()) * 0.5f).eval();
++
++        // 对角限幅：防协方差风洞（膨胀到无限），也防塌成 0 后彻底停止学习
++        for (uint8_t i = 0; i < n; i++) {
++            float d = Pnew(i, i);
++            if (!IsFinite(d))   d = pMax_;
++            else if (d > pMax_) d = pMax_;
++            else if (d < pMin_) d = pMin_;
++            Pnew(i, i) = d;
++        }
++        P = Pnew;
+     }
+ 
+     const float* GetWeights() const { return x_k; }
+@@ -144,6 +185,13 @@ public:
+     }
+ 
+ private:
++    /// 有限性判据（NaN / Inf 一律视为无效样本）
++    static bool IsFinite(float v) { return std::isfinite(v); }
++
++    /// 协方差对角上下界的默认倍率（相对 p_init）
++    static constexpr float kPMaxRatio = 1.0e4f;
++    static constexpr float kPMinRatio = 1.0e-6f;
++
+     const float lambda_ = 0.99999f;
+ 
+     float x_k[n]     {};
+@@ -153,6 +201,9 @@ private:
+ 
+     float beta_hat_k = 0;
+     float e_k        = 0;
++
++    float pMax_ = 0.0f;
++    float pMin_ = 0.0f;
+ };
+ 
+ }; // namespace alg::rls
+-- 
+2.53.0
+

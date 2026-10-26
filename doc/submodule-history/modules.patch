@@ -1,0 +1,1223 @@
+From ff19d18e1a282fb764e9c1ed2b8edb30fd0fed57 Mon Sep 17 00:00:00 2001
+From: Rookie002-start <200347378+Rookie002-start@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:34:14 +0800
+Subject: [PATCH] feat: add fused IMU support and health updates
+
+---
+ CMakeLists.txt                   |  10 +-
+ Kconfig                          |  37 ++-
+ imu/devices/hipnuc/hipnuc.cpp    | 423 +++++++++++++++++++++++++++++++
+ imu/devices/hipnuc/hipnuc.hpp    | 164 ++++++++++++
+ imu/devices/imu_device_layer.hpp |  17 ++
+ imu/drivers/heater.cpp           |  30 ++-
+ imu/drivers/heater.hpp           |   1 +
+ imu/drivers/imu.cpp              |  92 ++++++-
+ imu/drivers/imu.hpp              |   8 +-
+ powermeter/powermeter.cpp        |  15 +-
+ powermeter/powermeter.hpp        |  13 +-
+ remotes/remote.cpp               |   8 +-
+ remotes/vt13/vt13.cpp            |  18 +-
+ 13 files changed, 808 insertions(+), 28 deletions(-)
+ create mode 100644 imu/devices/hipnuc/hipnuc.cpp
+ create mode 100644 imu/devices/hipnuc/hipnuc.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cf95615..b35c402 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3,12 +3,15 @@
+ if(CONFIG_DUST_MOD_DEV_IMU)
+ 	target_sources(app PRIVATE
+ 		${CMAKE_CURRENT_SOURCE_DIR}/imu/drivers/imu.cpp
+-		${CMAKE_CURRENT_SOURCE_DIR}/imu/drivers/heater.cpp
+ 		${CMAKE_CURRENT_SOURCE_DIR}/imu/drivers/processor.cpp
+ 	)
+ 	target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/drivers)
+ 	target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/devices)
+ 
++	if(CONFIG_DUST_MOD_DEV_IMU_HEATER)
++		target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/drivers/heater.cpp)
++	endif()
++
+ 	if(CONFIG_DUST_MOD_DEV_IMU_BMI088)
+ 		target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/devices/bmi088/bmi088.cpp)
+ 		target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/devices/bmi088)
+@@ -18,6 +21,11 @@ if(CONFIG_DUST_MOD_DEV_IMU)
+ 		target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/devices/icm42688p/icm42688p.cpp)
+ 		target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/devices/icm42688p)
+ 	endif()
++
++	if(CONFIG_DUST_MOD_DEV_IMU_HIPNUC)
++		target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/devices/hipnuc/hipnuc.cpp)
++		target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/devices/hipnuc)
++	endif()
+ endif()
+ 
+ if(CONFIG_DUST_MOD_DEV_MOTOR_DJI)
+diff --git a/Kconfig b/Kconfig
+index 3dfe3e9..9bcb9c4 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -5,18 +5,30 @@ config DUST_MOD_DEV_IMU
+     default n
+     select DUST_FLT_QUATERNION
+     select DUST_TPC_IMU_TO
+-    select DUST_DEV_PWM
+-    select DUST_CTL_PID
+     select DUST_CTL_TIMER
+     select DUST_ID_STABILITY
+     help
+         IMU source decoupling, attitude EKF and zbus publish layer.
+ 
++config DUST_MOD_DEV_IMU_HEATER
++    bool "IMU heater (PWM + PID)"
++    default y if DUST_MOD_DEV_IMU_BMI088 || DUST_MOD_DEV_IMU_ICM42688P
++    depends on DUST_MOD_DEV_IMU
++    select DUST_DEV_PWM
++    select DUST_CTL_PID
++    help
++        裸传感器（BMI088 / ICM42688P）的 PWM + PID 恒温加热器。
++        默认随裸传感器一起打开；想先单独验证 IMU 通信时，在 prj.conf 里
++        写 CONFIG_DUST_MOD_DEV_IMU_HEATER=n 即可（加热器不初始化、不更新 PWM，
++        IMU 采样/校准/解算照常）。自带封装且无加热器的成品模块（如 HiPNUC）
++        不选本项，ImuManager 会跳过加热器初始化与预热。
++
+ config DUST_MOD_DEV_IMU_BMI088
+     bool "BMI088 IMU source"
+     default n
+     depends on DUST_MOD_DEV_IMU
+     select DUST_COM_SPI
++    select SPI_STM32_DMA
+     help
+         BMI088 source implementation for the IMU module.
+ 
+@@ -28,11 +40,32 @@ config DUST_MOD_DEV_IMU_ICM42688P
+     help
+         ICM42688P source implementation for the IMU module.
+ 
++config DUST_MOD_DEV_IMU_HIPNUC
++    bool "HiPNUC IMU source"
++    default n
++    depends on DUST_MOD_DEV_IMU
++    select DUST_COM_UART_DMA
++    help
++        HiPNUC HI 系列串口 IMU（0x5A 0xA5 帧头 / 0x91 组合数据帧）。
++        模块自带姿态融合，直接输出欧拉角与四元数，上层旁路 EKF；
++        无加热器，也不做驱动侧零偏采集。
++
++config DUST_MOD_DEV_IMU_HIPNUC_CRC
++    bool "HiPNUC frame CRC16 check"
++    default n
++    depends on DUST_MOD_DEV_IMU_HIPNUC
++    help
++        对 0x91 数据帧做 CRC16 校验（poly 0x1021，init 0xFFFF）。
++        需与模块固件 / 旧驱动 CRC.h 的多项式一致；不一致时保持 n，
++        仅用 0x5A 0xA5 帧头 + LEN + tag 做结构校验。
++
+ config DUST_MOD_DEV_IMU_IDENT
+     bool "IMU open-loop identification"
+     default n
++    depends on DUST_MOD_DEV_IMU
+     select DUST_ID_STABILITY
+     select DUST_COM_UART_DMA
++    select DUST_MOD_DEV_IMU_HEATER
+     help
+         IMU heater duty-step open-loop identification.
+ 
+diff --git a/imu/devices/hipnuc/hipnuc.cpp b/imu/devices/hipnuc/hipnuc.cpp
+new file mode 100644
+index 0000000..43dca14
+--- /dev/null
++++ b/imu/devices/hipnuc/hipnuc.cpp
+@@ -0,0 +1,423 @@
++/**
++ * @file hipnuc.cpp
++ * @author qingyu
++ * @brief HiPNUC HI 系列（0x5A 0xA5 / 0x91 组合帧）串口 IMU Source 实现
++ * @version 0.1
++ * @date 2026-09-10
++ */
++
++#include "hipnuc.hpp"
++#include "imu.hpp"
++
++#include <zephyr/devicetree.h>
++#include <zephyr/kernel.h>
++#include <zephyr/logging/log.h>
++
++#pragma message "Compiling Modules/Imu/Devices/HiPNUC"
++
++LOG_MODULE_REGISTER(hipnuc, LOG_LEVEL_INF);
++
++namespace hipnuc {
++
++namespace {
++
++/* 0x91 组合帧字段偏移（相对 payload 起点，小端） */
++constexpr uint16_t kOffMainStatus = 1;
++constexpr uint16_t kOffTemp       = 3;
++constexpr uint16_t kOffPressure   = 4;
++constexpr uint16_t kOffSystemTime = 8;
++constexpr uint16_t kOffAccel      = 12;
++constexpr uint16_t kOffGyro       = 24;
++constexpr uint16_t kOffMag        = 36;
++constexpr uint16_t kOffRoll       = 48;
++constexpr uint16_t kOffPitch      = 52;
++constexpr uint16_t kOffYaw        = 56;
++constexpr uint16_t kOffQuat       = 60;
++
++/* 串口波特率：**由设备树决定**（hipnuc-uart 节点的 current-speed）。
++   驱动不再硬编码 —— 改模块输出波特率时只改 overlay/板级 dts，这里自动跟随。
++   （注意：UartDma 会把这个值 uart_configure() 到硬件上，会覆盖 DT 的默认值，
++     所以必须显式取 DT 的值，否则会退回成别的数。） */
++constexpr uint32_t kBaudrate = DT_PROP(DT_ALIAS(hipnuc_uart), current_speed);
++
++#if defined(CONFIG_DUST_MOD_DEV_IMU_HIPNUC_CRC)
++/* CRC-16/XMODEM 查表（poly 0x1021，MSB 先出，输入/输出不反转、末尾不异或）：
++   与原来那个"每字节再循环 8 次移位"的实现**完全等价**（已逐字节对拍），
++   但把 76 字节 × 8 = 608 次迭代换成 76 次查表 —— 1 kHz 下这是每帧最大的一笔
++   CPU 开销（实测解析 ~80 µs/帧，占满一圈 1.5 ms 里的 ~0.5 ms）。
++   校验值："123456789" -> 0x31C3。 */
++constexpr uint16_t kWcrcTable[256] = {
++    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
++    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
++    0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
++    0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE,
++    0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485,
++    0xA56A, 0xB54B, 0x8528, 0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D,
++    0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4,
++    0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC,
++    0x48C4, 0x58E5, 0x6886, 0x78A7, 0x0840, 0x1861, 0x2802, 0x3823,
++    0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B,
++    0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12,
++    0xDBFD, 0xCBDC, 0xFBBF, 0xEB9E, 0x9B79, 0x8B58, 0xBB3B, 0xAB1A,
++    0x6CA6, 0x7C87, 0x4CE4, 0x5CC5, 0x2C22, 0x3C03, 0x0C60, 0x1C41,
++    0xEDAE, 0xFD8F, 0xCDEC, 0xDDCD, 0xAD2A, 0xBD0B, 0x8D68, 0x9D49,
++    0x7E97, 0x6EB6, 0x5ED5, 0x4EF4, 0x3E13, 0x2E32, 0x1E51, 0x0E70,
++    0xFF9F, 0xEFBE, 0xDFDD, 0xCFFC, 0xBF1B, 0xAF3A, 0x9F59, 0x8F78,
++    0x9188, 0x81A9, 0xB1CA, 0xA1EB, 0xD10C, 0xC12D, 0xF14E, 0xE16F,
++    0x1080, 0x00A1, 0x30C2, 0x20E3, 0x5004, 0x4025, 0x7046, 0x6067,
++    0x83B9, 0x9398, 0xA3FB, 0xB3DA, 0xC33D, 0xD31C, 0xE37F, 0xF35E,
++    0x02B1, 0x1290, 0x22F3, 0x32D2, 0x4235, 0x5214, 0x6277, 0x7256,
++    0xB5EA, 0xA5CB, 0x95A8, 0x8589, 0xF56E, 0xE54F, 0xD52C, 0xC50D,
++    0x34E2, 0x24C3, 0x14A0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
++    0xA7DB, 0xB7FA, 0x8799, 0x97B8, 0xE75F, 0xF77E, 0xC71D, 0xD73C,
++    0x26D3, 0x36F2, 0x0691, 0x16B0, 0x6657, 0x7676, 0x4615, 0x5634,
++    0xD94C, 0xC96D, 0xF90E, 0xE92F, 0x99C8, 0x89E9, 0xB98A, 0xA9AB,
++    0x5844, 0x4865, 0x7806, 0x6827, 0x18C0, 0x08E1, 0x3882, 0x28A3,
++    0xCB7D, 0xDB5C, 0xEB3F, 0xFB1E, 0x8BF9, 0x9BD8, 0xABBB, 0xBB9A,
++    0x4A75, 0x5A54, 0x6A37, 0x7A16, 0x0AF1, 0x1AD0, 0x2AB3, 0x3A92,
++    0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9,
++    0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
++    0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8,
++    0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0,
++};
++#endif
++
++} // namespace
++
++/**
++ * @brief 初始化 UART DMA 接收
++ *
++ * 使用蜂鸣器/遥控器之外的独立 UART（设备树 alias: hipnuc-uart）。
++ * 采用 UartDma 的软队列模式（不注册 rx_cb），解析放在 Read() 的线程上下文里做，
++ * 避免在中断里跑浮点解析。
++ */
++bool Hipnuc::Init()
++{
++    ResetRx();
++
++    UartDma::Config cfg {};
++    cfg.line_cfg.baudrate   = kBaudrate;          // 来自设备树
++    cfg.base_cfg.rx_timeout = 1000;
++
++    if (!uart_.Init(DEVICE_DT_GET(DT_ALIAS(hipnuc_uart)), cfg)) {
++        LOG_ERR("hipnuc uart init failed");
++        return false;
++    }
++
++    LOG_INF("hipnuc uart ready @%u (devicetree current-speed)", static_cast<unsigned>(kBaudrate));
++    return true;
++}
++
++/**
++ * @brief 延迟初始化
++ *
++ * HiPNUC 出厂已完成标定，没有需要从 flash 恢复的零偏参数，
++ * 因此这里不做任何事，保留接口仅为对齐 Source 生命周期。
++ */
++bool Hipnuc::LateInit()
++{
++    return true;
++}
++
++/**
++ * @brief 取出一帧最新样本
++ *
++ * 先把 UART 中所有可用字节喂进解析器，再判断本周期是否产出了新帧。
++ * 帧率通常 100~200Hz，上层 1ms 轮询，多数周期会返回 false。
++ */
++bool Hipnuc::Read(Sample& sample)
++{
++    Drain();
++
++    if (!has_new_frame_) {
++        return false;
++    }
++    has_new_frame_ = false;
++
++    for (uint8_t axis = 0; axis < 3; axis++) {
++        // 模块输出 °/s，统一到架构约定的 rad/s（EKF 与 topic 都用 rad/s）
++        sample.gyro[axis]  = gyro_deg_[axis] * kDeg2Rad;
++        sample.accel[axis] = accel_[axis];
++    }
++
++    for (uint8_t i = 0; i < 4; i++) {
++        sample.quaternion[i] = quat_[i];
++    }
++
++    sample.temp      = temp_;
++    sample.roll      = euler_deg_[0] * kDeg2Rad;
++    sample.pitch     = euler_deg_[1] * kDeg2Rad;
++    sample.yaw       = euler_deg_[2] * kDeg2Rad;
++    sample.yaw_total = yaw_total_deg_ * kDeg2Rad;
++    sample.fused     = true;
++
++    return true;
++}
++
++/**
++ * @brief 清空接收解析状态
++ */
++void Hipnuc::ResetRx()
++{
++    rx_len_       = 0;
++    has_new_frame_ = false;
++    has_last_yaw_  = false;
++    last_yaw_deg_  = 0.0f;
++    yaw_total_deg_ = 0.0f;
++}
++
++/**
++ * @brief 把 UART 软队列里的数据全部取出并解析
++ */
++void Hipnuc::Drain()
++{
++    uint8_t chunk[64];
++
++    for (;;)
++    {
++        const uint16_t n = uart_.Read(chunk, sizeof(chunk));
++        if (n == 0) {
++            break;
++        }
++        ParseChunk(chunk, n);
++    }
++}
++
++/**
++ * @brief 追加一段原始字节到累积缓冲并尝试解析
++ *
++ * 与旧驱动不同，这里保留了跨 chunk 的半帧：一帧 82 字节，DMA 软队列按块返回，
++ * 帧被切开是常态，必须在缓冲里攒齐再解析。
++ *
++ * @param data 本块数据
++ * @param len  本块长度
++ */
++void Hipnuc::ParseChunk(const uint8_t* data, uint16_t len)
++{
++    while (len > 0)
++    {
++        const uint16_t space = static_cast<uint16_t>(kRxBufSize - rx_len_);
++
++        if (space == 0) {
++            // 缓冲已满仍凑不出完整帧 → 丢最老一个字节重新同步，避免死锁
++            Consume(1);
++            ProcessBuffer();
++            continue;
++        }
++
++        const uint16_t n = (len < space) ? len : space;
++        memcpy(rx_buf_ + rx_len_, data, n);
++        rx_len_ = static_cast<uint16_t>(rx_len_ + n);
++        data   += n;
++        len    = static_cast<uint16_t>(len - n);
++
++        ProcessBuffer();
++    }
++}
++
++/**
++ * @brief 帧同步状态机
++ *
++ * 每轮：对齐 SOF → 读 LEN → 攒够整帧 → 校验解析 → 前移。
++ * 校验不过只滑动一个字节重新找 SOF，避免误判帧头时整帧丢数据。
++ */
++void Hipnuc::ProcessBuffer()
++{
++    for (;;)
++    {
++        // 1. 对齐帧头
++        if (rx_len_ < 2) {
++            return;
++        }
++        if (rx_buf_[0] != kSof0 || rx_buf_[1] != kSof1) {
++            Consume(1);
++            continue;
++        }
++
++        // 2. 读长度
++        if (rx_len_ < kFrameOverhead) {
++            return;
++        }
++        const uint16_t data_len = ReadLE<uint16_t>(rx_buf_ + 2);
++        if (data_len < 1 || data_len > kMaxPayloadLen) {
++            Consume(2);         // 假帧头，跳过 SOF 继续找
++            continue;
++        }
++
++        // 3. 攒够整帧
++        const uint16_t frame_len = static_cast<uint16_t>(data_len + kFrameOverhead);
++        if (rx_len_ < frame_len) {
++            return;
++        }
++
++        // 4. 校验 + 解析
++        if (ParseFrame(rx_buf_, data_len)) {
++            Consume(frame_len);
++            continue;
++        }
++
++        Consume(1);
++    }
++}
++
++/**
++ * @brief 校验并解析一帧
++ *
++ * 布局 A（SOF LEN CRC DATA）与布局 B（SOF LEN DATA CRC）都尝试，
++ * 以 payload 首字节 == 0x91 判定布局；开启 CRC 校验时再叠加 CRC 判定。
++ *
++ * @param frame    完整帧起始地址
++ * @param data_len 帧内 LEN 字段
++ * @return true    命中 0x91 并完成解析
++ */
++bool Hipnuc::ParseFrame(const uint8_t* frame, uint16_t data_len)
++{
++    const uint8_t* payload_a = frame + kPayloadOffsetA;
++    const uint8_t* payload_b = frame + kPayloadOffsetB;
++
++    const bool a_ok = (data_len >= kPayloadLen) && (payload_a[0] == kTag);
++    const bool b_ok = (data_len >= kPayloadLen) && (payload_b[0] == kTag);
++
++#if defined(CONFIG_DUST_MOD_DEV_IMU_HIPNUC_CRC)
++    if (a_ok && VerifyCrcLayoutA(frame, data_len)) {
++        ParsePayload(payload_a);
++        return true;
++    }
++    if (b_ok && VerifyCrcLayoutB(frame, data_len)) {
++        ParsePayload(payload_b);
++        return true;
++    }
++#else
++    if (a_ok) {
++        ParsePayload(payload_a);
++        return true;
++    }
++    if (b_ok) {
++        ParsePayload(payload_b);
++        return true;
++    }
++#endif
++
++    return false;
++}
++
++/**
++ * @brief 解析 0x91 payload
++ *
++ * 轴向补偿沿用旧驱动：gyro Y 取负、pitch 取负（模块在新板子上的安装方向补偿）。
++ * 四元数按模块原值透传，不做同样的补偿。
++ *
++ * @param payload payload 起始地址（长度 >= 76）
++ */
++void Hipnuc::ParsePayload(const uint8_t* payload)
++{
++    temp_     = static_cast<float>(static_cast<int8_t>(payload[kOffTemp]));
++    pressure_ = ReadLE<float>(payload + kOffPressure);
++
++    for (uint8_t axis = 0; axis < 3; axis++) {
++        accel_[axis] = ReadLE<float>(payload + kOffAccel + axis * 4);
++        mag_[axis]   = ReadLE<float>(payload + kOffMag   + axis * 4);
++    }
++
++    // 角速度：X/Y/Z 对应 roll/pitch/yaw；Y 取负为安装方向补偿
++    gyro_deg_[0] =  ReadLE<float>(payload + kOffGyro + 4);
++    gyro_deg_[1] = -ReadLE<float>(payload + kOffGyro);
++    gyro_deg_[2] =  ReadLE<float>(payload + kOffGyro + 8);
++
++    // 欧拉角：pitch 取负为安装方向补偿
++    euler_deg_[0] =  ReadLE<float>(payload + kOffRoll);
++    euler_deg_[1] = -ReadLE<float>(payload + kOffPitch);
++    euler_deg_[2] =  ReadLE<float>(payload + kOffYaw);
++
++    for (uint8_t i = 0; i < 4; i++) {
++        quat_[i] = ReadLE<float>(payload + kOffQuat + i * 4);
++    }
++
++    // yaw 解包络：模块 yaw 在 ±180° 跳变，这里累积成连续航向角
++    if (!has_last_yaw_)
++    {
++        has_last_yaw_  = true;
++        last_yaw_deg_  = euler_deg_[2];
++        yaw_total_deg_ = euler_deg_[2];
++    }
++    else
++    {
++        float delta = euler_deg_[2] - last_yaw_deg_;
++        if (delta > 180.0f) {
++            delta -= 360.0f;
++        } else if (delta < -180.0f) {
++            delta += 360.0f;
++        }
++        yaw_total_deg_ += delta;
++        last_yaw_deg_   = euler_deg_[2];
++    }
++
++    has_new_frame_ = true;
++}
++
++/**
++ * @brief 从累积缓冲头部丢弃 n 个字节
++ */
++void Hipnuc::Consume(uint16_t n)
++{
++    if (n >= rx_len_) {
++        rx_len_ = 0;
++        return;
++    }
++
++    rx_len_ = static_cast<uint16_t>(rx_len_ - n);
++    memmove(rx_buf_, rx_buf_ + n, rx_len_);
++}
++
++#if defined(CONFIG_DUST_MOD_DEV_IMU_HIPNUC_CRC)
++
++/**
++ * @brief CRC-16（poly 0x1021，初值 0x0000，不反转、末尾不异或 → XMODEM）
++ *
++ * 注意：多项式需与模块固件/旧驱动 CRC.h 一致；不一致时请关闭
++ * CONFIG_DUST_MOD_DEV_IMU_HIPNUC_CRC，改用 tag + LEN 结构校验。
++ *
++ * @param data 数据
++ * @param len  长度
++ * @param crc  上一次的 CRC 值（首段传 0x0000）
++ * @return 累进后的 CRC
++ */
++uint16_t Hipnuc::Crc16(const uint8_t* data, uint16_t len, uint16_t crc)
++{
++    /* 查表实现（poly 0x1021，MSB 先出）：与原来的逐位移位版本完全等价，
++       每字节只做一次查表 + 一次异或。见 kWcrcTable 的说明。 */
++    for (uint16_t i = 0; i < len; i++)
++    {
++        crc = static_cast<uint16_t>((crc << 8) ^
++              kWcrcTable[((crc >> 8) ^ data[i]) & 0x00FFU]);
++    }
++    return crc;
++}
++
++/**
++ * @brief 布局 A 校验：CRC 位于 [4..5]，覆盖 SOF+LEN+DATA
++ */
++bool Hipnuc::VerifyCrcLayoutA(const uint8_t* frame, uint16_t data_len)
++{
++    const uint16_t expected = ReadLE<uint16_t>(frame + 4);
++    uint16_t crc = Crc16(frame, 4, 0x0000);
++    crc = Crc16(frame + kPayloadOffsetA, data_len, crc);
++    return crc == expected;
++}
++
++/**
++ * @brief 布局 B 校验：CRC 位于 payload 之后，覆盖 SOF+LEN+DATA
++ */
++bool Hipnuc::VerifyCrcLayoutB(const uint8_t* frame, uint16_t data_len)
++{
++    const uint16_t expected = ReadLE<uint16_t>(frame + kPayloadOffsetB + data_len);
++    uint16_t crc = Crc16(frame, 4, 0x0000);
++    crc = Crc16(frame + kPayloadOffsetB, data_len, crc);
++    return crc == expected;
++}
++
++#endif // CONFIG_DUST_MOD_DEV_IMU_HIPNUC_CRC
++
++REGISTER_IMU(Hipnuc, hipnuc);
++
++} // namespace hipnuc
+diff --git a/imu/devices/hipnuc/hipnuc.hpp b/imu/devices/hipnuc/hipnuc.hpp
+new file mode 100644
+index 0000000..0bd758c
+--- /dev/null
++++ b/imu/devices/hipnuc/hipnuc.hpp
+@@ -0,0 +1,164 @@
++/**
++ * @file hipnuc.hpp
++ * @author qingyu
++ * @brief HiPNUC HI 系列（0x5A 0xA5 / 0x91 组合帧）串口 IMU Source
++ * @version 0.1
++ * @date 2026-09-10
++ *
++ * HiPNUC 模块内部已完成姿态融合，直接输出工程单位
++ * （欧拉角 / 四元数 / 角速度 / 加速度 / 磁力计 / 气压）。
++ *
++ * 与 BMI088 / ICM42688P 的差异：
++ * - 传输：UART 帧协议（模块主动上报），不是 SPI 寄存器读写
++ * - 数据：直接是工程量，没有“原始计数 → *Convert*() 换算”这条链路
++ * - 姿态：模块自带融合，Read() 出去的样本带 fused 标志，上层旁路 EKF
++ * - 标定：出厂已标定，不做驱动侧零偏采集
++ * - 加热：成品模块无加热器
++ *
++ * 因此本类直接继承 Source，而不继承 CalibSource。
++ *
++ * @par 帧格式（布局 A，与 HiPNUC 手册字段顺序一致）
++ * @code
++ *   SOF(2, 0x5A 0xA5) | LEN(2, LE) | CRC16(2, LE) | DATA(LEN)
++ * @endcode
++ * 兼容部分固件使用的布局 B：
++ * @code
++ *   SOF(2, 0x5A 0xA5) | LEN(2, LE) | DATA(LEN) | CRC16(2, LE)
++ * @endcode
++ * 两种布局总开销都是 6 字节，靠 payload 首字节 tag 自动判定。
++ *
++ * @par 0x91 组合数据帧字段（payload 起点，小端，合计 76 字节）
++ * @code
++ *   0  tag           u8      = 0x91
++ *   1  main_status   u16
++ *   3  temperature   i8      °C
++ *   4  air_pressure  f32
++ *   8  system_time   u32
++ *   12 acc_b         f32[3]  m/s²
++ *   24 gyr_b         f32[3]  °/s
++ *   36 mag_b         f32[3]
++ *   48 roll          f32     deg
++ *   52 pitch         f32     deg
++ *   56 yaw           f32     deg
++ *   60 quat          f32[4]  WXYZ
++ * @endcode
++ */
++
++#pragma once
++
++#include "imu_device_layer.hpp"
++#include "uart.hpp"
++
++#include <cstdint>
++#include <cstring>
++
++namespace hipnuc {
++
++/**
++ * @brief HiPNUC HI 系列串口 IMU 数据源
++ *
++ * UART DMA 收字节 → 跨 chunk 累积 → 状态机找 0x5A 0xA5 → 校验并解析 0x91 帧。
++ * Read() 在 ImuManager 线程上下文轮询调用，取出最新一帧并转成统一 Sample。
++ */
++class Hipnuc final : public Source
++{
++public:
++    bool Init() override;
++    bool LateInit() override;
++
++    /**
++     * @brief 取出一帧最新样本
++     *
++     * 先把 UART 中所有可用字节喂进解析器，若期间解析出完整 0x91 帧则返回 true。
++     * 输出的 gyro 已换算为 rad/s，欧拉角为 deg，quaternion 为 WXYZ。
++     *
++     * @param sample 输出样本（fused = true）
++     * @return true  本周期拿到新帧
++     * @return false 无新帧
++     */
++    bool Read(Sample& sample) override;
++
++    /** 模块出厂已标定，驱动侧不做零偏采集 */
++    bool Calibrate() override { return true; }
++
++    /** 气压（附加数据，调试/扩展用，不进 topic 契约） */
++    float GetPressure() const { return pressure_; }
++
++    /** 磁力计（附加数据，调试/扩展用，不进 topic 契约） */
++    void GetMag(float* out) const
++    {
++        if (out == nullptr) {
++            return;
++        }
++        out[0] = mag_[0];
++        out[1] = mag_[1];
++        out[2] = mag_[2];
++    }
++
++private:
++    /* ---------------- 协议常量 ---------------- */
++
++    /* 串口波特率不再在这里硬编码：由设备树决定（hipnuc-uart 节点的 current-speed），
++       见 hipnuc.cpp 里的 kBaudrate —— 改模块输出波特率时只改 overlay/板级 dts。 */
++
++    static constexpr uint8_t  kSof0           = 0x5A;   // 帧头
++    static constexpr uint8_t  kSof1           = 0xA5;
++    static constexpr uint8_t  kTag            = 0x91;   // 组合数据帧 tag
++
++    static constexpr uint16_t kPayloadLen     = 76;     // 0x91 payload 长度
++    static constexpr uint16_t kFrameOverhead  = 6;      // SOF(2) + LEN(2) + CRC16(2)
++    static constexpr uint16_t kPayloadOffsetA = 6;      // SOF LEN CRC DATA
++    static constexpr uint16_t kPayloadOffsetB = 4;      // SOF LEN DATA CRC
++    static constexpr uint16_t kMaxPayloadLen  = 128;    // LEN 合理性上限
++    static constexpr uint16_t kRxBufSize      = 256;    // 跨 chunk 累积缓冲
++
++    static constexpr float kDeg2Rad = 0.01745329251994329577f;
++
++    /* ---------------- 接收与解析 ---------------- */
++
++    UartDma  uart_ {};
++
++    uint8_t  rx_buf_[kRxBufSize] {};
++    uint16_t rx_len_ = 0;
++
++    /* ---------------- 最新一帧解析结果 ---------------- */
++
++    float gyro_deg_[3]   {0.0f, 0.0f, 0.0f};              // °/s
++    float accel_[3]      {0.0f, 0.0f, 0.0f};              // m/s²
++    float mag_[3]        {0.0f, 0.0f, 0.0f};
++    float euler_deg_[3]  {0.0f, 0.0f, 0.0f};              // roll / pitch / yaw
++    float quat_[4]       {1.0f, 0.0f, 0.0f, 0.0f};        // WXYZ
++    float pressure_      = 0.0f;
++    float temp_          = 0.0f;
++    float yaw_total_deg_ = 0.0f;                          // 解包络后的累计航向
++
++    bool  has_last_yaw_  = false;
++    float last_yaw_deg_  = 0.0f;
++    bool  has_new_frame_ = false;
++
++    /* ---------------- 内部实现 ---------------- */
++
++    void ResetRx();
++    void Drain();
++    void ParseChunk(const uint8_t* data, uint16_t len);
++    void ProcessBuffer();
++    bool ParseFrame(const uint8_t* frame, uint16_t data_len);
++    void ParsePayload(const uint8_t* payload);
++    void Consume(uint16_t n);
++
++#if defined(CONFIG_DUST_MOD_DEV_IMU_HIPNUC_CRC)
++    static uint16_t Crc16(const uint8_t* data, uint16_t len, uint16_t crc);
++    static bool     VerifyCrcLayoutA(const uint8_t* frame, uint16_t data_len);
++    static bool     VerifyCrcLayoutB(const uint8_t* frame, uint16_t data_len);
++#endif
++
++    template <typename T>
++    static T ReadLE(const uint8_t* p)
++    {
++        T v {};
++        memcpy(&v, p, sizeof(T));
++        return v;
++    }
++};
++
++} // namespace hipnuc
+diff --git a/imu/devices/imu_device_layer.hpp b/imu/devices/imu_device_layer.hpp
+index a6272cb..362fcb6 100644
+--- a/imu/devices/imu_device_layer.hpp
++++ b/imu/devices/imu_device_layer.hpp
+@@ -20,6 +20,15 @@
+  *
+  * 具体 IMU 驱动负责完成寄存器读取、单位换算与驱动侧校准，
+  * 上层姿态线程统一消费这个结构。
++ *
++ * 两类数据源共用本结构：
++ * - 寄存器型（BMI088 / ICM42688P）：只填 gyro/accel/temp/dt，fused 保持 false，
++ *   姿态由上层 QuaternionEkf 解算；
++ * - 融合型（HiPNUC 等成品模块）：置 fused = true，并填 quaternion/roll/pitch/yaw/
++ *   yaw_total，上层直接发布，跳过 EKF，避免二次融合。
++ *
++ * 单位约定：gyro = rad/s，accel = m/s²，temp = °C，欧拉角 = deg，
++ * quaternion = WXYZ（与 topic::imu_to::Message 一致）。
+  */
+ struct Sample
+ {
+@@ -27,6 +36,14 @@ struct Sample
+     float accel[3] = {0.0f, 0.0f, 0.0f};
+     float temp     = 0.0f;
+     float dt       = 0.001f;           // 积分步长(s)，EKF 姿态解算使用
++
++    /* ---- 融合型数据源专用（fused == true 时有效） ---- */
++    bool  fused         = false;                          // 是否为模块自带融合输出
++    float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};       // WXYZ
++    float roll          = 0.0f;                           // deg
++    float pitch         = 0.0f;                           // deg
++    float yaw           = 0.0f;                           // deg，±180 内
++    float yaw_total     = 0.0f;                           // deg，解包络后的累计航向
+ };
+ 
+ /**
+diff --git a/imu/drivers/heater.cpp b/imu/drivers/heater.cpp
+index 760f8b3..d34e414 100644
+--- a/imu/drivers/heater.cpp
++++ b/imu/drivers/heater.cpp
+@@ -23,12 +23,16 @@ namespace {
+     static constexpr float kMaxDuty     = 0.95f;
+     static constexpr float kMinDuty     = 0.0f;
+     static constexpr float kTargetTemp  = 40.0f;
++    static constexpr float kOverTempC   = 60.0f;        // 超温阈值 (°C)，达到就切断加热
+ 
+     static constexpr alg::pid::Pid::Config kPidConfig {
+         .kp         = 0.19f, 
+         .ki         = 0.03f, 
+         .kd         = 0.0005f,
+-        .iOutMax    = 0.5f, 
++        /* 积分权限必须覆盖整个输出量程：iOutMax 同时是积分项幅值上限
++         * （iClamp = iOutMax/ki）。原来是 0.5，导致误差为 0 时最多只能输出
++         * 50% 占空比，保温需要更大占空比时温度永远到不了目标值（静差）。 */
++        .iOutMax    = kMaxDuty, 
+         .outMax     = kMaxDuty, 
+         .dt         = 0.001f,
+     };
+@@ -316,6 +320,14 @@ void Heater::Update(float temperature)
+ {
+     if (!initialized_) return;
+ 
++    /* 超温保护：闭环路径同样要有（辨识路径已有 kOverTempC 保护）。
++     * 达到阈值直接切加热并清积分，防止传感器异常时持续大功率加热。 */
++    if (temperature >= kOverTempC) {
++        LOG_ERR("heater over temp: %.1f >= %.1f, cut off", (double)temperature, (double)kOverTempC);
++        Stop();
++        return;
++    }
++
+     if (mode_ == Mode::ClosedLoop)
+     {
+         duty_ = pid_.Calc(kTargetTemp, temperature);
+@@ -332,6 +344,22 @@ void Heater::Update(float temperature)
+     (void)heater_pwm_.SetDuty(duty_);
+ }
+ 
++/**
++ * @brief 立即切断加热
++ *
++ * 超温或没有可信温度（IMU 读取失败）时调用：占空比置 0 并清 PID 积分，
++ * 避免 PWM 冻结在上一档持续加热、也避免恢复瞬间带着旧积分冲过头。
++ */
++void Heater::Stop()
++{
++    duty_ = kMinDuty;
++    pid_.SetIntegralError(0.0f);
++
++    if (initialized_) {
++        (void)heater_pwm_.SetDuty(duty_);
++    }
++}
++
+ /**
+  * @brief 预热 — 更新 PID 并判断温度是否达到稳态
+  * @param temperature 当前温度 (°C)
+diff --git a/imu/drivers/heater.hpp b/imu/drivers/heater.hpp
+index 3a886a3..cf74794 100644
+--- a/imu/drivers/heater.hpp
++++ b/imu/drivers/heater.hpp
+@@ -67,6 +67,7 @@ class Heater final
+ public:
+     bool  Init();
+     void  Update(float temperature);
++    void  Stop();                              // 立即切断加热（超温 / 无有效温度时用）
+     float GetDuty()        const { return duty_; }
+     bool  Preheat(float temperature, float dt_s);
+ 
+diff --git a/imu/drivers/imu.cpp b/imu/drivers/imu.cpp
+index 6f9188f..78608bf 100644
+--- a/imu/drivers/imu.cpp
++++ b/imu/drivers/imu.cpp
+@@ -7,12 +7,19 @@
+  */
+ 
+ #include "imu.hpp"
+-#include "heater.hpp"
++#if defined(CONFIG_WDT_SUPERVISOR)
++#include "health.hpp"
++#endif
+ #include <cstddef>
++#include <cstring>
+ #include <zephyr/kernel.h>
+ #include <zephyr/devicetree.h>
+ #include <zephyr/logging/log.h>
+ 
++#ifdef CONFIG_DUST_MOD_DEV_IMU_HEATER
++#include "heater.hpp"
++#endif
++
+ #pragma message "Compiling Modules/Imu/Drivers/Imu"
+ 
+ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
+@@ -26,7 +33,7 @@ namespace imu {
+  * @brief 初始化 IMU 管理器
+  *
+  * 按依赖顺序串联各子模块：
+- * 选择数据源 → 初始化驱动 → 初始化加热器
++ * 选择数据源 → 初始化驱动 → 初始化加热器（CONFIG_DUST_MOD_DEV_IMU_HEATER 时）
+  * → 可选自动校准（AutoCalib）或辨识（AutoIdent）
+  * → LateInit：flash 有校准数据则加载，无则保持 reg 默认
+  * → 初始化姿态解算器。
+@@ -48,6 +55,7 @@ bool ImuManager::Init(ImuStartMode mode)
+     }
+     LOG_INF("InitSource done");
+ 
++#ifdef CONFIG_DUST_MOD_DEV_IMU_HEATER
+     if (!heater_.Init()) {
+         LOG_ERR("heater init failed");
+         return false;
+@@ -55,6 +63,7 @@ bool ImuManager::Init(ImuStartMode mode)
+ 
+     LOG_INF("start preheat");
+     Preheat();
++#endif
+ 
+     if (mode == ImuStartMode::AutoCalib)
+     {
+@@ -75,6 +84,31 @@ bool ImuManager::Init(ImuStartMode mode)
+     return true;
+ }
+ 
++/**
++ * @brief 把当前样本转成 topic 消息
++ *
++ * 融合型数据源（fused == true，如 HiPNUC）已经给出姿态，
++ * 直接搬运到消息结构，跳过 EKF，避免二次融合；
++ * 寄存器型数据源（BMI088 / ICM42688P）仍走 QuaternionEkf 解算。
++ */
++void ImuManager::PublishSample()
++{
++    if (sample_.fused)
++    {
++        memcpy(pub_.quaternion, sample_.quaternion, sizeof(pub_.quaternion));
++        memcpy(pub_.gyro,       sample_.gyro,       sizeof(pub_.gyro));
++
++        pub_.roll        = sample_.roll;
++        pub_.pitch       = sample_.pitch;
++        pub_.yaw         = sample_.yaw;
++        pub_.yaw_total   = sample_.yaw_total;
++        pub_.temperature = sample_.temp;
++        return;
++    }
++
++    attitude_.Process(sample_, pub_);
++}
++
+ /**
+  * @brief 任务函数
+  *
+@@ -94,10 +128,26 @@ void ImuManager::Task()
+         return (delta_ns == 0) ? sample_.dt : static_cast<float>(delta_ns) * 1.0e-9f;
+     };
+ 
+-    log_timer_.SetPeriod(1);
++    /* Timer 的周期单位是循环次数（本循环 1ms 一圈），1000 次 = 1s 打一行；
++     * 原来写 1 是每 1ms 一行（约 1000 行/s），会把 console 刷满、冲掉其他打印。 */
++    log_timer_.SetPeriod(1000);
++
++    /* 周期用「绝对截止时刻」维持（与下板 gimbal 线程同一套做法）：
++     * 之前是 k_msleep(1) 的相对睡法，系统 tick 是 0.5ms，
++     *   used = k_uptime_ticks() - tick_start 会被量化，
++     * 循环体不足半拍时 used 读作 0 → 多睡整整一拍，1ms 目标实测跑成 ~1.5ms
++     * （发布率只有 ~650Hz，1kHz 的 IMU 数据被抽稀）。
++     * 睡到绝对 deadline 后，tick 量化误差与循环体耗时一起被吸收：
++     * 只要循环体 < period，平均周期就恒等于 period。
++     * 循环体超时（> period）时不硬追，重排基准，不往后欠债。 */
++    const int64_t period = k_ms_to_ticks_ceil64(1);
++    int64_t deadline = k_uptime_ticks() + period;
+ 
+     for (;;)
+     {
++#if defined(CONFIG_WDT_SUPERVISOR)
++        wdg_health::Mark(wdg_health::Service::Imu);
++#endif
+         log_timer_.Update();
+ 
+         if (source_ != nullptr && source_->Read(sample_))
+@@ -105,19 +155,36 @@ void ImuManager::Task()
+             // 用真实经过时间修正当前样本积分周期，避免调度抖动直接传进 EKF。
+             sample_.dt = kMeasureDT();
+ 
++#ifdef CONFIG_DUST_MOD_DEV_IMU_HEATER
+             heater_.Update(sample_.temp);
++#endif
+ 
+-            attitude_.Process(sample_, pub_);
+-            
+-            // zbus_chan_pub(&pub_imu_to, &pub_, K_MSEC(1));
++            PublishSample();
++
++            pub_.version++;                 // 发布计数：消费者据此判断源是否在发布
++            zbus_chan_pub(&pub_imu_to, &pub_, K_MSEC(1));
+         }
++#ifdef CONFIG_DUST_MOD_DEV_IMU_HEATER
++        else
++        {
++            /* IMU 读取失败：拿不到可信温度，立刻切断加热，
++             * 否则 PWM 会停在上一次的占空比（可能是升温阶段的满功率）一直加热。 */
++            heater_.Stop();
++        }
++#endif
+ 
+         log_timer_.Clock([&]()  {
+-            printk("%f,%f,%f\n", (double)pub_.roll, (double)pub_.pitch, (double)pub_.yaw);
++            // printk("%f,%f,%f\n", (double)pub_.roll, (double)pub_.pitch, (double)pub_.yaw);
+             // printk("%f, %f\n", (double)sample_.temp, (double)heater_.GetDuty());
+         });
+-        
+-        k_msleep(1);
++
++        // 睡到绝对截止时刻；本拍已经过点就直接重排基准
++        if (k_uptime_ticks() < deadline) {
++            k_sleep(K_TIMEOUT_ABS_TICKS(deadline));
++        } else {
++            deadline = k_uptime_ticks();
++        }
++        deadline += period;
+     }
+ }
+ 
+@@ -154,12 +221,15 @@ bool ImuManager::InitSource()
+  * @brief 等待加热器达到目标温度
+  *
+  * 循环采集温度样本，直到加热器稳定在目标温度附近。
++ * 未启用 CONFIG_DUST_MOD_DEV_IMU_HEATER 时（无加热器的数据源，如 HiPNUC）
++ * 该函数直接返回 true。
+  *
+  * @return true  温度稳定
+  * @return false 数据源失效
+  */
+ bool ImuManager::Preheat()
+ {
++#ifdef CONFIG_DUST_MOD_DEV_IMU_HEATER
+     constexpr uint32_t kWaitUs    = 1000;               // 采样间隔 (µs)
+     constexpr uint32_t kTimeoutMs = 10000;              // 超时时间 (ms)
+ 
+@@ -206,6 +276,10 @@ bool ImuManager::Preheat()
+ 
+         k_busy_wait(kWaitUs);
+     }
++#else
++    // 无加热器的数据源（如 HiPNUC 成品模块），直接跳过预热
++    return true;
++#endif
+ }
+ 
+ } // namespace imu
+diff --git a/imu/drivers/imu.hpp b/imu/drivers/imu.hpp
+index 4afc808..adcec36 100644
+--- a/imu/drivers/imu.hpp
++++ b/imu/drivers/imu.hpp
+@@ -14,9 +14,12 @@
+ #include "thread.hpp"
+ #include "timer.hpp"
+ #include "imu_device_layer.hpp"
+-#include "heater.hpp"
+ #include "processor.hpp"
+ 
++#ifdef CONFIG_DUST_MOD_DEV_IMU_HEATER
++#include "heater.hpp"
++#endif
++
+ namespace imu {
+ 
+ struct ImuEntry {
+@@ -50,7 +53,9 @@ private:
+     Source                  *source_    = nullptr;
+     Sample                  sample_     {};
+     attitude::Processor     attitude_   {};
++#ifdef CONFIG_DUST_MOD_DEV_IMU_HEATER
+     heater::Heater          heater_     {};
++#endif
+ 
+     Timer                   log_timer_  {10};
+     topic::imu_to::Message  pub_        {};
+@@ -59,6 +64,7 @@ private:
+     bool                    ready_      = false;
+ 
+     bool InitSource();
++    void PublishSample();
+     bool Preheat();
+ 
+     void Task();
+diff --git a/powermeter/powermeter.cpp b/powermeter/powermeter.cpp
+index 4d39c19..9407ace 100644
+--- a/powermeter/powermeter.cpp
++++ b/powermeter/powermeter.cpp
+@@ -16,10 +16,13 @@
+ void PowerMeter::CanCpltRxCallback(uint8_t* buffer)
+ {
+     const uint8_t* data         = buffer;
+-    const uint16_t shunt_raw    = (static_cast<int16_t>(data[0]) << 8) | static_cast<uint16_t>(data[1]);
+-    const uint16_t bus_raw      = (static_cast<int16_t>(data[2]) << 8) | static_cast<uint16_t>(data[3]);
+-    const uint16_t current_raw  = (static_cast<int16_t>(data[4]) << 8) | static_cast<uint16_t>(data[5]);
+-    const uint16_t power_raw    = (static_cast<int16_t>(data[6]) << 8) | static_cast<uint16_t>(data[7]);
++    const int16_t shunt_raw     = static_cast<int16_t>((static_cast<uint16_t>(data[0]) << 8) | data[1]);
++    // 注意必须用 int16_t：这四个量都是**带符号**的。
++    // 之前用 uint16_t 接，刹车/回馈时电流 −0.79 A 会被读成 +64.75 A（65536−786），
++    // 看起来像"制动狂吸 65A"，直接误导了功率模型的判断。
++    const int16_t bus_raw       = static_cast<int16_t>((static_cast<uint16_t>(data[2]) << 8) | data[3]);
++    const int16_t current_raw   = static_cast<int16_t>((static_cast<uint16_t>(data[4]) << 8) | data[5]);
++    const int16_t power_raw     = static_cast<int16_t>((static_cast<uint16_t>(data[6]) << 8) | data[7]);
+ 
+     /* seqlock 写锁：允许其他中断，线程读到冲突时会自旋重试 */
+     atomic_inc(&seq_);
+@@ -27,5 +30,7 @@ void PowerMeter::CanCpltRxCallback(uint8_t* buffer)
+     bus_volt   = static_cast<float>(bus_raw)     * 0.001f;  // V
+     current    = static_cast<float>(current_raw) * 0.001f;  // A
+     power      = static_cast<float>(power_raw)   * 0.01f;   // W
++    frames_   += 1;
++    stamp_ms_  = k_uptime_get_32();
+     atomic_inc(&seq_);
+-}
+\ No newline at end of file
++}
+diff --git a/powermeter/powermeter.hpp b/powermeter/powermeter.hpp
+index 96598a3..2a256f0 100644
+--- a/powermeter/powermeter.hpp
++++ b/powermeter/powermeter.hpp
+@@ -13,6 +13,7 @@
+ 
+ #include "stdint.h"
+ #include <zephyr/sys/atomic.h>
++#include <zephyr/kernel.h>
+ 
+ class PowerMeter
+ {
+@@ -29,6 +30,8 @@ public:
+ 
+     struct Snapshot {
+         float shunt_volt, bus_volt, current, power;
++        uint32_t frames;      ///< 已解析的测量帧计数（判断"这一拍有没有新样本"）
++        uint32_t stamp_ms;    ///< 该帧的接收时刻（k_uptime 毫秒，掉线判据）
+     };
+ 
+     /** @brief 批量读——seqlock 保护，一次拿到所有值的一致快照 */
+@@ -43,6 +46,8 @@ public:
+             snap.bus_volt   = bus_volt;
+             snap.current    = current;
+             snap.power      = power;
++            snap.frames     = frames_;
++            snap.stamp_ms   = stamp_ms_;
+         } while (atomic_get(&seq_) != seq);
+         return snap;
+     }
+@@ -52,6 +57,9 @@ public:
+     float GetCurrent()   const { return current;    }
+     float GetPower()     const { return power;      }
+ 
++    /** @brief 已解析帧计数（配合 ReadAll().frames 判断有没有新样本） */
++    uint32_t FrameCount() const { return frames_; }
++
+ private:
+     uint16_t rx_id_  = 0x00;
+ 
+@@ -60,5 +68,8 @@ private:
+     float current    = 0.0f;
+     float power      = 0.0f;
+ 
++    volatile uint32_t frames_   = 0;      ///< CAN 回调里自增，seqlock 保护
++    volatile uint32_t stamp_ms_ = 0;      ///< 最近一帧的 k_uptime 毫秒
++
+     mutable atomic_t seq_ = 0;
+-};
+\ No newline at end of file
++};
+diff --git a/remotes/remote.cpp b/remotes/remote.cpp
+index f208b0c..d3d7ad1 100644
+--- a/remotes/remote.cpp
++++ b/remotes/remote.cpp
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include "remote.hpp"
++#if defined(CONFIG_WDT_SUPERVISOR)
++#include "health.hpp"
++#endif
+ #include <zephyr/logging/log.h>
+ #include <string.h>
+ 
+@@ -25,6 +28,9 @@ void Remote::Task()
+ {
+     for (;;)
+     {
++#if defined(CONFIG_WDT_SUPERVISOR)
++        wdg_health::Mark(wdg_health::Service::Remote);
++#endif
+         if (k_sem_take(&uart_->sem_, K_MSEC(50)) == 0)
+         {
+             uint8_t tmp[32];
+@@ -32,7 +38,6 @@ void Remote::Task()
+             {
+                 uint16_t n = uart_->Read(tmp, sizeof(tmp));
+                 if (n == 0) break;
+-
+                 ProcessChunk(tmp, n);
+             }
+         }
+@@ -167,6 +172,7 @@ void Remote::HandleLocked()
+             detect_.last_valid_ms = k_uptime_get_32();
+             detect_.fail_count = 0;
+             Consume(entry->frame_size);
++            zbus_chan_pub(&pub_remote_to, &pub_, K_MSEC(1)); 
+         } else {
+             detect_.fail_count++;
+             Consume(entry->frame_size);
+diff --git a/remotes/vt13/vt13.cpp b/remotes/vt13/vt13.cpp
+index 334fdd8..1054f7c 100644
+--- a/remotes/vt13/vt13.cpp
++++ b/remotes/vt13/vt13.cpp
+@@ -138,10 +138,10 @@ bool Vt13Protocol::Decode(const uint8_t* buffer, uint8_t len, Message& pub)
+     constexpr int16_t kCenter = 1024;
+     constexpr float   kInvChannelSpan = 1.0f / 660.0f;
+ 
+-    od.ch.chassisx  = normChannelInv(raw_data->channel_0, kCenter, kInvChannelSpan);
+-    od.ch.chassisy  = normChannelInv(raw_data->channel_1, kCenter, kInvChannelSpan);
+-    od.ch.yaw       = normChannelInv(raw_data->channel_2, kCenter, kInvChannelSpan);
+-    od.ch.pitch     = normChannelInv(raw_data->channel_3, kCenter, kInvChannelSpan);
++    od.ch.yaw       = normChannelInv(raw_data->channel_0, kCenter, kInvChannelSpan);
++    od.ch.pitch     = normChannelInv(raw_data->channel_1, kCenter, kInvChannelSpan);
++    od.ch.chassisx  = normChannelInv(raw_data->channel_2, kCenter, kInvChannelSpan);
++    od.ch.chassisy  = normChannelInv(raw_data->channel_3, kCenter, kInvChannelSpan);
+ 
+     od.sw.fn1       = raw_data->fn_1;
+     od.sw.fn2       = raw_data->fn_2;
+@@ -192,6 +192,8 @@ void Vt13Protocol::FillOutputData(const OutputData& od, Message& pub)
+ {
+     processChannel(pub, od);
+ 
++    pub.wheel = od.sw.wheel;
++
+     switch (od.sw.cns)
+     {
+         case SWITCH_C:
+@@ -201,15 +203,17 @@ void Vt13Protocol::FillOutputData(const OutputData& od, Message& pub)
+             pub.chassis_mode = ChassisMode::Normal;
+             break;
+         case SWITCH_S:
++            pub.chassis_mode = ChassisMode::Stop;
+             break;
+         default:
+             pub.chassis_mode = ChassisMode::Normal;
+             break;
+     }
+ 
+-    pub.reload_ctrl   = od.sw.fn1     ? StartMode::On : StartMode::Off;
+-    pub.shoot_ctrl    = od.sw.fn2     ? StartMode::On : StartMode::Off;
+-    pub.autoaim_ctrl  = od.sw.fn2     ? StartMode::On : StartMode::Off;
++    pub.friction_ctrl = od.sw.fn1     ? StartMode::On : StartMode::Off;
++    pub.reload_ctrl   = od.sw.fn2     ? StartMode::On : StartMode::Off;
++    pub.shoot_ctrl    = od.sw.trigger ? StartMode::On : StartMode::Off;
++    pub.autoaim_ctrl  = od.sw.pause     ? StartMode::On : StartMode::Off;
+     pub.supercap_ctrl = od.keyboard.v ? StartMode::On : StartMode::Off;
+ 
+     pub.version++;
+-- 
+2.53.0
+

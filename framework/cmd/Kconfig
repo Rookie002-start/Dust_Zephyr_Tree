@@ -1,0 +1,29 @@
+config DUST_CMD_SHELL_VAR
+    bool "Enable debug variable interaction (l/g/s commands)"
+    default n
+    select DUST_COM_UART_DMA
+    help
+        Enable a self-maintained UART polling thread for debug variable
+        interaction. Commands: l (list), g <name> (get), s <name> <v> (set).
+        Threads register variables via REGISTER_SHELL_VAR().
+
+config DUST_CMD_BUZZER
+    bool "Enable PWM buzzer control"
+    default n
+    select DUST_DEV_PWM
+    help
+        Enable buzzer control class based on PWM output.
+
+config DUST_CMD_W25Q128
+    bool "Enable W25Q128 SPI NOR Flash driver"
+    default n
+    select DUST_COM_SPI
+    help
+        Enable W25Q128 SPI NOR Flash driver for read/write/erase operations.
+
+config DUST_CMD_FLASH
+    bool "Enable Flash partition support"
+    default n
+    select DUST_CMD_W25Q128
+    help
+        Flash partition layout and allocation for cmd/flash.

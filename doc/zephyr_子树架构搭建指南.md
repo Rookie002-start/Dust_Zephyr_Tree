@@ -241,8 +241,9 @@ west update
 
 ### 5.1 配置 SSH（访问私有仓库）
 
-`zephyr_user` 和架构子模块在 `qingyu0310` 的 GitHub。**推荐用自定义 SSH host**（走 443，
-用 qingyu0310 的私钥）。在 `C:\Users\<你>\.ssh\config` 追加：
+`zephyr_user` 位于 `Rookie002-start/Dust_Zephyr_Tree`，架构层已经是仓库内的普通目录，
+不再需要单独拉取子模块。**推荐用自定义 SSH host**（走 443）。在
+`C:\Users\<你>\.ssh\config` 追加：
 
 ```text
 Host github-qingyu0310
@@ -267,28 +268,15 @@ Host github.com
 
 ```powershell
 cd E:\Zephyr
-git clone git@github-qingyu0310:qingyu0310/Dust_Zephyr_Tree.git zephyr_user
+git clone git@github-qingyu0310:Rookie002-start/Dust_Zephyr_Tree.git zephyr_user
 ```
 
-### 5.3 拉 framework 架构子模块 + 业务工程子模块
-
-```powershell
-cd E:\Zephyr\zephyr_user
-git submodule update --init --recursive
-```
-
-这会拉齐 `.gitmodules` 里声明的 7 个子模块（framework 的 6 层 + project 业务工程）：
-`drivers` `algorithm` `modules` `topic` `cmd` `init` `project`。
-
-> `framework/init` 的 url 是 `git@github.com:...`（标准 SSH），依赖 [§5.1](#51-配置-ssh访问私有仓库)
-> 里 `Host github.com` 那段（否则报 qingyu0620 无权限，见 [FAQ §9.6](#96-ssh-认证成-qingyu0620)）。
-
-### 5.4 确认子树完整
+### 5.3 确认子树完整
 
 ```powershell
 ls E:\Zephyr\zephyr_user\framework     # 应看到 algorithm cmd drivers init modules topic zephyr
 ls E:\Zephyr\zephyr_user\platform\cmsis  # 应看到 Kconfig cmsis_core.h zephyr
-git -C E:\Zephyr\zephyr_user submodule status   # 每层都指向具体 commit（无 `-` 前缀）
+git -C E:\Zephyr\zephyr_user status             # 工作区应为干净状态
 ```
 
 ---

@@ -1,0 +1,307 @@
+From 0e5218cd2aae61eb51ce95757374de56d7b7f145 Mon Sep 17 00:00:00 2001
+From: Rookie002-start <200347378+Rookie002-start@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:34:14 +0800
+Subject: [PATCH] fix: harden CAN, UART and USB integration
+
+---
+ communication/can/can.cpp               | 16 ++++--
+ communication/can/can.hpp               |  5 +-
+ communication/stream/uart/uart.cpp      | 67 ++++++++++++++++++++-----
+ communication/stream/uart/uart.hpp      | 14 ++++--
+ communication/stream/usb/CMakeLists.txt | 59 +++++++++++++++-------
+ 5 files changed, 124 insertions(+), 37 deletions(-)
+
+diff --git a/communication/can/can.cpp b/communication/can/can.cpp
+index 4d6d8b5..29449ec 100644
+--- a/communication/can/can.cpp
++++ b/communication/can/can.cpp
+@@ -35,7 +35,16 @@ bool Can::Init(const struct device *dev, const struct can_filter &filter, can_mo
+     }
+ 
+     if (ctrl_mode != CAN_MODE_NORMAL) {
+-        (void)can_set_mode(dev_, ctrl_mode);
++        /* 不能吞掉返回值：驱动在编译期没打开 CAN FD 支持时这里会返回 -ENOTSUP，
++         * 而控制器随后照常 can_start() 成经典 CAN 模式 —— 之后所有带
++         * FDF/BRS 的帧都会被驱动拒掉，现象是"总线上一帧都没有，但也没有报错"。
++         * 早点失败比静默跑错模式好。 */
++        const int mode_ret = can_set_mode(dev_, ctrl_mode);
++        if (mode_ret != 0) {
++            LOG_ERR("can_set_mode(0x%x) fail %d %s",
++                    static_cast<unsigned>(ctrl_mode), mode_ret, dev->name);
++            return false;
++        }
+     }
+ 
+     if (can_start(dev_) != 0) {
+@@ -69,10 +78,11 @@ void Can::SetRxCallback(RxCallback cb, void *user_data)
+  * @brief 发送 CAN 帧（阻塞）
+  * @param frame  CAN 帧
+  */
+-bool Can::Send(const struct can_frame *frame)
++bool Can::Send(const struct can_frame *frame, k_timeout_t timeout)
+ {
+     if (dev_ == nullptr) return false;
+-    int ret = can_send(dev_, frame, K_NO_WAIT, tx_callback, this);
++    int ret = can_send(dev_, frame, timeout, tx_callback, this);
++    /* 0 = 已排进 TX 邮箱；真正的发送结果（是否被对端 ACK）由 TX 回调给出 */
+     return ret == 0;
+ }
+ 
+diff --git a/communication/can/can.hpp b/communication/can/can.hpp
+index cfcbcb4..b4cb0a4 100644
+--- a/communication/can/can.hpp
++++ b/communication/can/can.hpp
+@@ -94,7 +94,10 @@ public:
+               can_mode_t ctrl_mode = CAN_MODE_NORMAL);
+     void SetTxCallback(TxCallback cb, void *user_data = nullptr);
+     void SetRxCallback(RxCallback cb, void *user_data = nullptr);
+-    bool Send(const struct can_frame *frame);
++    /// @param timeout 等待空 TX 邮箱的时间：
++    ///                K_NO_WAIT = 邮箱满就丢这一帧；给超时（如 K_MSEC(2)）则等空邮箱。
++    ///                连发多帧时必须给超时，否则只有前 3 帧（3 个邮箱）发得出去。
++    bool Send(const struct can_frame *frame, k_timeout_t timeout = K_NO_WAIT);
+ 
+     const struct device *Device() const { return dev_; }
+ 
+diff --git a/communication/stream/uart/uart.cpp b/communication/stream/uart/uart.cpp
+index 83f2d7a..23314ff 100644
+--- a/communication/stream/uart/uart.cpp
++++ b/communication/stream/uart/uart.cpp
+@@ -60,14 +60,29 @@ void uart_dma_callback(const struct device* dev, struct uart_event* evt, void* u
+             self->buf_free_[1] = true;
+     };
+ 
++    // UART_RX_DISABLED 有两种来源：主动 StopRx 和异常/超时停止。
++    // STM32 异步驱动在 uart_rx_disable() 内部同步回调本事件，因此主动停止时
++    // 绝不能在这里重启接收（否则 StartRx 会拿到 -EBUSY）。
+     auto on_rx_disabled = [self, dev]()
+     {
+-        self->cur_buf_ = 0;
+-        self->buf_free_[0] = true;
++        // buf0 即将交回硬件，先占位，避免 BUF_REQUEST 把同一块 buffer 又交回去
++        self->cur_buf_     = 0;
++        self->buf_free_[0] = false;
+         self->buf_free_[1] = true;
++
++        atomic_set(&self->ready_, 0);
++
++        if (atomic_get(&self->rx_stopped_)) {
++            return;                                     // 主动停止：等 StartRx 再开
++        }
++
+         int32_t timeout = self->config_.base_cfg.rx_timeout;
+         int ret = uart_rx_enable(dev, self->dma_buf_[0], UartDma::kMaxBufSize, timeout);
+-        if (ret < 0) { atomic_set(&self->ready_, 0); }
++        if (ret < 0) {
++            LOG_ERR("rx restart fail %d", ret);
++            return;
++        }
++        atomic_set(&self->ready_, 1);
+     };
+ 
+     auto on_tx_done = [self]()
+@@ -129,13 +144,17 @@ bool UartDma::Init(const struct device* dev, const Config& cfg)
+         return false;
+     }
+ 
++    // 先占住 buf0 再 rx_enable：驱动的第一个 UART_RX_BUF_REQUEST 是在
++    // uart_rx_enable() 内部同步发出的，否则它会把正在用的 buf0 又交回去。
++    buf_free_[0] = false;
++    buf_free_[1] = true;
++
+     ret = uart_rx_enable(dev_, dma_buf_[0], kMaxBufSize, config_.base_cfg.rx_timeout);
+     if (ret < 0) {
+         LOG_ERR("rx_enable fail %d", ret);
+         return false;
+     }
+ 
+-    buf_free_[0] = false;
+     atomic_set(&ready_, 1);
+     LOG_INF("uart dma ready %s", dev->name);
+     return true;
+@@ -150,13 +169,25 @@ bool UartDma::Init(const struct device* dev, const Config& cfg)
+  */
+ uint16_t UartDma::Read(uint8_t* buf, uint16_t max_len)
+ {
+-    uint32_t size;
++    uint16_t cnt = 0;
++
++    /* ⚠️ 必须与中断侧的 Reserve/Commit 处在同一个临界区里。
++       中断侧 on_rx_rdy 是 irq_lock + Reserve + memcpy + Commit；线程侧这里原来是
++       「取块 + 拷贝 + Decommit」裸跑，于是线程可能在自己 Decommit 走到一半（region
++       A/B 状态只改了一半）时被收包中断打断，ISR 拿这个中间态去 Reserve，算出界外
++       指针再把数据 memcpy 过去 —— 实测在 1 kHz/921600（82 kB/s，ISR 每次拷 82 B）
++       下就会踩到，表现为 Instruction Access fault 崩机。
++       关中断期间只做一次 ≤ max_len 的 memcpy，代价可忽略。 */
++    const unsigned int key = irq_lock();
++    uint32_t size = 0;
+     uint8_t* data = rx_bip_.GetContiguousReadBlock(size);
+-    if (!data || size == 0) return 0;
++    if (data != nullptr && size != 0) {
++        cnt = (max_len < size) ? max_len : static_cast<uint16_t>(size);
++        memcpy(buf, data, cnt);
++        rx_bip_.Decommit(cnt);
++    }
++    irq_unlock(key);
+ 
+-    uint16_t cnt = (max_len < size) ? max_len : size;
+-    memcpy(buf, data, cnt);
+-    rx_bip_.Decommit(cnt);
+     return cnt;
+ }
+ 
+@@ -202,13 +233,19 @@ bool UartDma::Send(const uint8_t* data, uint32_t len)
+  */
+ bool UartDma::StartRx()
+ {
++    // 先清掉"主动停止"标志，并占住 buf0，再让硬件开始接收
++    atomic_set(&rx_stopped_, 0);
++
++    cur_buf_     = 0;
++    buf_free_[0] = false;
++    buf_free_[1] = true;
++
+     int ret = uart_rx_enable(dev_, dma_buf_[0], kMaxBufSize, config_.base_cfg.rx_timeout);
+     if (ret < 0) {
+         LOG_ERR("rx_enable fail %d", ret);
+         return false;
+     }
+ 
+-    buf_free_[0] = false;
+     atomic_set(&ready_, 1);
+     return true;
+ }
+@@ -220,8 +257,14 @@ void UartDma::StopRx()
+ {
+     k_spinlock_key_t key = k_spin_lock(&lock_);
+ 
+-    if (uart_rx_disable(dev_) == 0) {
+-        atomic_set(&ready_, 0);
++    // 先声明"这是主动停止"：uart_rx_disable() 会同步回调 UART_RX_DISABLED，
++    // 回调据此不再自动重启接收，交回给 StartRx()。
++    atomic_set(&rx_stopped_, 1);
++
++    int ret = uart_rx_disable(dev_);
++    atomic_set(&ready_, 0);
++    if (ret < 0) {
++        atomic_set(&rx_stopped_, 0);                    // 本来就没在收，撤销标志
+     }
+     k_spin_unlock(&lock_, key);
+ }
+diff --git a/communication/stream/uart/uart.hpp b/communication/stream/uart/uart.hpp
+index 8896726..3a656b3 100644
+--- a/communication/stream/uart/uart.hpp
++++ b/communication/stream/uart/uart.hpp
+@@ -86,13 +86,19 @@ public:
+     bool     Send(const uint8_t* data, uint32_t len) override;
+ 
+ private:
+-    static constexpr uint16_t kMaxBufSize = 256;    // 缓冲区最大值
++    /// DMA 双缓冲单块 / 发送缓冲大小（也是中断侧单次 Reserve 的上限）
++    static constexpr uint16_t kMaxBufSize = 512;
++
++    /// 软件接收环容量：中断侧（生产者）Reserve/Commit 与线程侧（消费者）Read/Decommit 共用。
++    /// 82 kB/s（HiPNUC 1 kHz × 82 B）下 2 KB ≈ 25 ms，足够吸收线程调度抖动；
++    /// 约束：必须 ≥ kMaxBufSize（单次 Reserve 不会超过一块 DMA buffer）。
++    static constexpr uint32_t kRxRingSize = 2048;
+ 
+     uint8_t  dma_buf_[2][kMaxBufSize] {};           // 硬件 DMA 双缓冲
+     uint8_t  cur_buf_ = 0;                          // 当前提交给硬件的 DMA buffer 索引
+     bool     buf_free_[2] = {true, true};   // DMA buffer 空闲状态跟踪
+ 
+-    BipBuffer<kMaxBufSize * 2> rx_bip_ {};          // 软件缓冲队列
++    BipBuffer<kRxRingSize> rx_bip_ {};              // 软件缓冲队列
+ 
+     uint8_t  tx_data_[kMaxBufSize] {};              // 发送缓冲
+     uint8_t* tx_buf_ = tx_data_;                    // 指向发送缓冲
+@@ -102,6 +108,7 @@ private:
+ 
+     Config      config_ {};
+     atomic_t    ready_ = ATOMIC_INIT(0);            // 初始化完成标志
++    atomic_t    rx_stopped_ = ATOMIC_INIT(0);       // 主动停止 RX 标志（区分异常停止）
+     k_spinlock  lock_;
+     
+     bool ApplyLineConfig();
+@@ -113,7 +120,6 @@ private:
+         buf_free_[1] = true;
+         atomic_set(&tx_busy_, 0);
+         atomic_set(&ready_, 0);
++        atomic_set(&rx_stopped_, 0);
+     }
+ };
+-
+-
+diff --git a/communication/stream/usb/CMakeLists.txt b/communication/stream/usb/CMakeLists.txt
+index 949ebad..c576510 100644
+--- a/communication/stream/usb/CMakeLists.txt
++++ b/communication/stream/usb/CMakeLists.txt
+@@ -1,24 +1,49 @@
+-# 中间层（栈内核）
++# USB 设备栈装配：中间层（栈内核） + 芯片 HAL + Stream 适配层
++#
++# ⚠️ 本目录由**应用** CMakeLists（add_subdirectory(${FW_ROOT}/drivers)）装配，属于 Zephyr 的
++#    "application mode"：此时 zephyr_library() 创建的库**不会进链接**
++#    （extensions.cmake 只在配置阶段给一条警告）。所以这里与 framework 其它层保持
++#    一致，统一用 target_sources(app PRIVATE ...) 直接编进 app。
++
++# ---- 中间层（栈内核）----
+ if(CONFIG_DUST_USB_DEVICE_STACK)
+-    zephyr_library()
+-    zephyr_library_sources(core/usb_dev_port.cpp core/usb_cdc_acm.cpp core/usb_descriptor.cpp)
+-    zephyr_library_include_directories(interface core)
+-    zephyr_include_directories(interface core)   # 全局暴露，供业务代码裸文件名引用
++    target_sources(app PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/core/usb_dev_port.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/core/usb_cdc_acm.cpp
++        ${CMAKE_CURRENT_SOURCE_DIR}/core/usb_descriptor.cpp
++    )
++    target_include_directories(app PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/interface
++        ${CMAKE_CURRENT_SOURCE_DIR}/core
++        # 接收环形缓冲用 DUST_BUF_BIPBUF（algorithm 层默认只把 include 加给 app 目标）
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../algorithm/buffer/bipbuf
++    )
++    # 全局暴露，供业务代码裸文件名引用
++    zephyr_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/interface
++                               ${CMAKE_CURRENT_SOURCE_DIR}/core)
+ endif()
+-# 芯片 HAL（HPM）
++
++# ---- 芯片 HAL（HPM）----
+ if(CONFIG_DUST_USB_DEVICE_HAL_HPM)
+-    zephyr_library_sources(hal/hpm/usb_hal_hpm.cpp
++    target_sources(app PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/hal/hpm/usb_hal_hpm.cpp
+         ${SDK_GLUE_DIR}/../sdk_env/hpm_sdk/components/usb/device/hpm_usb_device.c
+-        ${SDK_GLUE_DIR}/../sdk_env/hpm_sdk/drivers/src/hpm_usb_drv.c)
+-    zephyr_library_include_directories(hal/hpm)
+-    zephyr_include_directories(hal/hpm)
+-    zephyr_include_directories(${SDK_GLUE_DIR}/../sdk_env/hpm_sdk/components/usb/device
+-                               ${SDK_GLUE_DIR}/../sdk_env/hpm_sdk/drivers/inc)
++        ${SDK_GLUE_DIR}/../sdk_env/hpm_sdk/drivers/src/hpm_usb_drv.c
++    )
++    target_include_directories(app PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/hal/hpm
++        ${SDK_GLUE_DIR}/../sdk_env/hpm_sdk/components/usb/device
++        ${SDK_GLUE_DIR}/../sdk_env/hpm_sdk/drivers/inc
++    )
++    zephyr_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/hal/hpm)
+ endif()
+-# Stream 适配层（应用使能 DUST_COM_USB 时编译）
++
++# ---- Stream 适配层（应用使能 DUST_COM_USB 时编译）----
+ if(CONFIG_DUST_COM_USB)
+-    zephyr_library_sources(usb.cpp)
+-    zephyr_library_include_directories(.)
+-    zephyr_include_directories(.)
+-    zephyr_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../)   # 提供 stream.hpp
++    target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/usb.cpp)
++    target_include_directories(app PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}
++        ${CMAKE_CURRENT_SOURCE_DIR}/..     # 提供 stream.hpp
++    )
++    zephyr_include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ endif()
+-- 
+2.53.0
+

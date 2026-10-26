@@ -1,0 +1,108 @@
+# algorithm/Kconfig — 算法与控制器
+# 提供 PID/功率控制/滤波器/参数辨识等计算模块
+# 不直接依赖硬件，可在仿真或离线环境中使用
+# 头文件在 algorithm/controller/ 和 algorithm/identify/ 下
+
+config DUST_BUF_BIPBUF
+	bool "双区环形缓冲区"
+	default n
+	help
+	    双区环形缓冲区（BipBuffer），保证可读块连续，零拷贝 DMA 友好。
+
+config DUST_BUF_RINGBUF
+	bool "环形缓冲区"
+	default n
+	help
+	    环形缓冲区（Ring Buffer），固定内存池 FIFO。
+	    写满时丢弃新数据，保留一格区分空/满。
+
+config DUST_CTL_EXECTIMER
+    bool "ExecTimer"
+    default n
+    help
+        代码段执行时间测量工具，支持多节点分段计时。
+
+config DUST_CTL_PID
+    bool "PID控制器"
+    default n
+    help
+        位置式PID控制器，支持微分先行/积分分离/变速积分/D项低通滤波
+
+config DUST_CTL_TIMER
+    bool "软件定时器"
+    default n
+    help
+        软件定时器
+
+config DUST_FLT_HPF
+    bool "信号滤波器"
+    default n
+    help
+        一阶高通滤波器
+
+config DUST_FLT_KALMAN
+    bool "Kalman filter"
+    default n
+    select DUST_MATH_EIGEN
+    help
+        模板化通用线性 Kalman 滤波器，固定尺寸编译期优化。
+
+config DUST_FLT_KALMAN_EKF
+    bool "ExtendedKalman template"
+    default n
+    select DUST_MATH_EIGEN
+    help
+        模板化扩展卡尔曼滤波器（EKF），使用 SystemFunc/ObserveFunc
+        回调替代 Hook 模式，固定尺寸编译期优化。
+
+config DUST_FLT_LPF
+    bool "信号滤波器"
+    default n
+    help
+        一阶低通滤波器
+
+config DUST_FLT_QUATERNION
+    bool "Quaternion attitude EKF"
+    default n
+    select DUST_FLT_KALMAN_EKF
+    help
+        基于四元数的 IMU 姿态解算 EKF。
+        内部使用 ExtendedKalman<6, 3, 3> 作为滤波引擎。
+
+config DUST_ID_RLS
+    bool "递归最小二乘法"
+    default n
+    select DUST_MATH_EIGEN
+    help
+        递归最小二乘法
+
+config DUST_ID_MOTOR_PLANT
+    bool "电机本体辨识"
+    default n
+    select DUST_ID_RLS
+    help
+        基于 RLS 的电机本体辨识（torque→omega）。
+        输出离散模型 a/b/c 和连续域 K/τ/delay。
+
+config DUST_ID_STABILITY
+    bool "稳定判据与波形发生器"
+    default n
+    help
+        滑动窗口稳定判据 + 方波/三角波/正弦波发生器。
+        header-only，无依赖。
+
+config DUST_MATH_EIGEN
+    bool "Eigen 线性代数库"
+    default n
+    help
+        Eigen 5 header-only 线性代数库，提供矩阵/向量运算。
+        其他算法模块可通过 select DUST_MATH_EIGEN 自动启用。
+
+config DUST_MOD_CTL_POWER
+    bool "功率控制器"
+    default n
+    select DUST_CTL_PID
+    select DUST_ID_RLS
+    select DUST_FLT_LPF
+    help
+        电机功率控制，包含功率模型预测/RLS参数辨识/隶属度分配/受限力矩求解

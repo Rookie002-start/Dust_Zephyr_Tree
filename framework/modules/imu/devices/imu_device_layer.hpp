@@ -1,0 +1,213 @@
+/**
+ * @file imu_mid_layer.hpp
+ * @author qingyu
+ * @brief IMU 数据源公共基类与共享数据结构
+ * @version 0.1
+ * @date 2026-06-03
+ */
+
+#pragma once
+
+#include <math.h>
+#include <stdint.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include "partition.hpp"
+#include "w25q128.hpp"
+
+/**
+ * @brief 一帧 IMU 工程量样本
+ *
+ * 具体 IMU 驱动负责完成寄存器读取、单位换算与驱动侧校准，
+ * 上层姿态线程统一消费这个结构。
+ *
+ * 两类数据源共用本结构：
+ * - 寄存器型（BMI088 / ICM42688P）：只填 gyro/accel/temp/dt，fused 保持 false，
+ *   姿态由上层 QuaternionEkf 解算；
+ * - 融合型（HiPNUC 等成品模块）：置 fused = true，并填 quaternion/roll/pitch/yaw/
+ *   yaw_total，上层直接发布，跳过 EKF，避免二次融合。
+ *
+ * 单位约定：gyro = rad/s，accel = m/s²，temp = °C，欧拉角 = deg，
+ * quaternion = WXYZ（与 topic::imu_to::Message 一致）。
+ */
+struct Sample
+{
+    float gyro[3]  = {0.0f, 0.0f, 0.0f};
+    float accel[3] = {0.0f, 0.0f, 0.0f};
+    float temp     = 0.0f;
+    float dt       = 0.001f;           // 积分步长(s)，EKF 姿态解算使用
+
+    /* ---- 融合型数据源专用（fused == true 时有效） ---- */
+    bool  fused         = false;                          // 是否为模块自带融合输出
+    float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};       // WXYZ
+    float roll          = 0.0f;                           // deg
+    float pitch         = 0.0f;                           // deg
+    float yaw           = 0.0f;                           // deg，±180 内
+    float yaw_total     = 0.0f;                           // deg，解包络后的累计航向
+};
+
+/**
+ * @brief 具体 IMU 驱动需要实现的统一接口
+ */
+class Source
+{
+public:
+    virtual ~Source() = default;
+
+    virtual bool Init() = 0;
+    virtual bool LateInit() = 0;
+    virtual bool Read(Sample& sample) = 0;
+    virtual bool Calibrate() { return true; }
+};
+
+/**
+ * @brief 原始 IMU 寄存器样本
+ *
+ * 统一保存 accel/gyro/temperature 原始计数，供公共后处理流程复用。
+ */
+struct ImuRawSample
+{
+    int16_t accel[3] = {0, 0, 0};
+    int16_t gyro [3] = {0, 0, 0};
+    int16_t temp     = 0;
+};
+
+/**
+ * @brief IMU 零偏校准参数
+ */
+struct ImuOffsetData
+{
+    float gyro_offset [3] = {0.0f, 0.0f, 0.0f};
+    float accel_offset[3] = {0.0f, 0.0f, 0.0f};
+};
+
+/**
+ * @brief IMU 灵敏度比例
+ */
+struct ImuScaleData
+{
+    float gyro_scale [3] = {1.0f, 1.0f, 1.0f};
+    float accel_scale[3] = {1.0f, 1.0f, 1.0f};
+};
+
+/**
+ * @brief 带公共校准与单位换算流程的 IMU 数据源基类
+ *
+ * 子类只需提供原始样本读取与工程量换算函数，
+ * 基类自动处理校准参数维护和工程量转换。
+ */
+class CalibSource : public Source
+{
+public:
+    bool Calibrate() override
+    {
+        constexpr uint32_t kCalibPeriodUs   = 1000;
+        constexpr uint32_t kCalibCnt        = 200;
+        constexpr float    kGravity         = 9.807f;
+
+        // 忙等直到传感器瞬态稳定，避免上电漂移污染静态均值；不切任务。
+        constexpr uint32_t kSettleMs = 50;
+        k_busy_wait(kSettleMs * 1000);
+
+        float gyro_sum [3] = {0.0f, 0.0f, 0.0f};
+        float accel_sum[3] = {0.0f, 0.0f, 0.0f};
+
+        for (uint16_t sample_idx = 0; sample_idx < kCalibCnt; sample_idx++)
+        {
+            ImuRawSample raw {};
+            if (!ReadRaw(raw)) {
+                return false;
+            }
+
+            for (uint8_t axis = 0; axis < 3; axis++) {
+                gyro_sum [axis] += ConvertGyro (raw.gyro [axis]);
+                accel_sum[axis] += ConvertAccel(raw.accel[axis]);
+            }
+
+            k_busy_wait(kCalibPeriodUs);
+        }
+
+        const float inv_samples = 1.0f / static_cast<float>(kCalibCnt);
+        float accel_mean[3] = {0.0f, 0.0f, 0.0f};
+        float accel_norm_sq = 0.0f;
+
+        for (uint8_t axis = 0; axis < 3; axis++) {
+            offset_.gyro_offset[axis] = gyro_sum[axis] * inv_samples;
+            accel_mean[axis]  = accel_sum [axis]  * inv_samples;
+            accel_norm_sq    += accel_mean[axis]  * accel_mean[axis];
+        }
+
+        if (accel_norm_sq > 0.0f)
+        {
+            const float accel_norm = sqrtf(accel_norm_sq);
+            const float gravity_scale = kGravity / accel_norm;
+
+            for (uint8_t axis = 0; axis < 3; axis++) {
+                const float expected_gravity = accel_mean[axis] * gravity_scale;
+                offset_.accel_offset[axis] = accel_mean[axis] - expected_gravity;
+            }
+        }
+
+        printk("calib gyro_off: %.6f %.6f %.6f\n",
+               (double)offset_.gyro_offset[0],
+               (double)offset_.gyro_offset[1],
+               (double)offset_.gyro_offset[2]);
+        printk("calib accel_off: %.6f %.6f %.6f\n",
+               (double)offset_.accel_offset[0],
+               (double)offset_.accel_offset[1],
+               (double)offset_.accel_offset[2]);
+
+        // 校准完成，写入 flash
+        if (EXEC_FLASH_WRITE(flash::kPartCalib.offset, &offset_, sizeof(ImuOffsetData))) {
+            printk("calib flash save ok\n");
+        } else {
+            printk("calib flash save failed\n");
+        }
+
+        calibrated_ = true;
+
+        return true;
+    }
+
+    bool Read(Sample& sample) override
+    {
+        ImuRawSample raw {};
+        if (!ReadRaw(raw)) {
+            return false;
+        }
+
+        for (uint8_t axis = 0; axis < 3; axis++)
+        {
+            const float accel = ConvertAccel(raw.accel[axis]);
+            const float gyro  = ConvertGyro (raw.gyro [axis]);
+
+            sample.accel[axis] = Correct(accel,
+                                         offset_.accel_offset[axis],
+                                         scale_.accel_scale[axis]);
+            sample.gyro [axis] = Correct(gyro,
+                                         offset_.gyro_offset[axis],
+                                         scale_.gyro_scale[axis]);
+        }
+
+        sample.temp = ConvertTemperature(raw.temp);
+        sample.dt = 0.001f;
+        return true;
+    }
+
+protected:
+    virtual bool  ReadRaw(ImuRawSample& raw)      = 0;
+    virtual float ConvertAccel(int16_t raw) const = 0;
+    virtual float ConvertGyro(int16_t raw)  const = 0;
+    virtual float ConvertTemperature(int16_t raw) const = 0;
+
+    static float Correct(float value, float offset, float scale)
+    {
+        return (value - offset) * scale;
+    }
+
+protected:
+    ImuOffsetData offset_ {};
+    ImuScaleData  scale_  {};
+
+    bool calibrated_ = false;
+};

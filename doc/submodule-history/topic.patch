@@ -1,0 +1,127 @@
+From d959b398c1e14480cd04a977ba2c3aa6bd07c1af Mon Sep 17 00:00:00 2001
+From: Rookie002-start <200347378+Rookie002-start@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 20:34:14 +0800
+Subject: [PATCH] fix: update IMU and remote state messages
+
+---
+ imu_to/imu_to.cpp       | 4 +---
+ imu_to/imu_to.hpp       | 6 +++++-
+ remote_to/remote_to.cpp | 4 +---
+ remote_to/remote_to.hpp | 5 +++--
+ to_can_tx/to_can_tx.cpp | 3 ++-
+ to_can_tx/to_can_tx.hpp | 2 ++
+ 6 files changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/imu_to/imu_to.cpp b/imu_to/imu_to.cpp
+index 0e441b3..da44cda 100644
+--- a/imu_to/imu_to.cpp
++++ b/imu_to/imu_to.cpp
+@@ -17,7 +17,5 @@ ZBUS_CHAN_DEFINE(pub_imu_to,
+                  topic::imu_to::Message,
+                  NULL,
+                  NULL,
+-                 ZBUS_OBSERVERS(sub_imu_to),
++                 ZBUS_OBSERVERS_EMPTY,        // 无订阅者：消费者用 zbus_chan_read 轮询最新值
+                  ZBUS_MSG_INIT({}));
+-
+-ZBUS_SUBSCRIBER_DEFINE(sub_imu_to, 10);
+diff --git a/imu_to/imu_to.hpp b/imu_to/imu_to.hpp
+index 8afeeeb..0413a14 100644
+--- a/imu_to/imu_to.hpp
++++ b/imu_to/imu_to.hpp
+@@ -11,12 +11,17 @@
+ 
+ #pragma once
+ 
++#include <stdint.h>
+ #include <zephyr/zbus/zbus.h>
+ 
+ namespace topic::imu_to {
+ 
+ struct Message
+ {
++    /// 每次发布递增（IMU 模块在 zbus_chan_pub 前自增）。
++    /// 消费者据此判断"数据是否真的更新过 / 源是否在发布"：从未发布会保持 0。
++    uint32_t version = 0;
++
+     float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+     float gyro[3]       = {0.0f, 0.0f, 0.0f};
+ 
+@@ -30,4 +35,3 @@ struct Message
+ } // namespace topic::imu_to
+ 
+ ZBUS_CHAN_DECLARE(pub_imu_to);
+-ZBUS_OBS_DECLARE(sub_imu_to);
+diff --git a/remote_to/remote_to.cpp b/remote_to/remote_to.cpp
+index 40ca3cf..18c2939 100644
+--- a/remote_to/remote_to.cpp
++++ b/remote_to/remote_to.cpp
+@@ -18,7 +18,5 @@ ZBUS_CHAN_DEFINE(pub_remote_to,
+                  topic::remote_to::Message,
+                  NULL,
+                  NULL,
+-                 ZBUS_OBSERVERS(sub_remote_to),
++                 ZBUS_OBSERVERS_EMPTY,        // 无订阅者：消费者用 zbus_chan_read 轮询最新值
+                  ZBUS_MSG_INIT({}));
+-
+-ZBUS_SUBSCRIBER_DEFINE(sub_remote_to, 10);
+diff --git a/remote_to/remote_to.hpp b/remote_to/remote_to.hpp
+index 6f78257..74933f8 100644
+--- a/remote_to/remote_to.hpp
++++ b/remote_to/remote_to.hpp
+@@ -20,6 +20,7 @@ enum class ChassisMode : uint8_t
+ {
+     Normal = 0,
+     Spin,
++    Stop
+ };
+ 
+ enum class StartMode : uint8_t
+@@ -43,10 +44,12 @@ struct Message
+     float chassisy = 0.0f;
+     float yaw      = 0.0f;
+     float pitch    = 0.0f;
++    float wheel    = 0.0f;
+ 
+     /* 模式标志 */
+     ChassisMode chassis_mode    = ChassisMode::Normal;
+ 
++    StartMode   friction_ctrl   = StartMode::Off;
+     StartMode   shoot_ctrl      = StartMode::Off;
+     StartMode   reload_ctrl     = StartMode::Off;
+     StartMode   autoaim_ctrl    = StartMode::Off;
+@@ -56,5 +59,3 @@ struct Message
+ }
+ 
+ ZBUS_CHAN_DECLARE(pub_remote_to);
+-
+-ZBUS_OBS_DECLARE(sub_remote_to);
+diff --git a/to_can_tx/to_can_tx.cpp b/to_can_tx/to_can_tx.cpp
+index be74180..8967a40 100644
+--- a/to_can_tx/to_can_tx.cpp
++++ b/to_can_tx/to_can_tx.cpp
+@@ -14,6 +14,7 @@
+ 
+ #pragma message "Compiling Topic/To_Can_Tx"
+ 
+-K_MSGQ_DEFINE(user_can1_msgq,  sizeof(topic::to_can_tx::Message), 16, 4);  // 深度 16，4 字节对齐，满时 K_NO_WAIT 直接丢帧
++K_MSGQ_DEFINE(user_can1_msgq,  sizeof(topic::to_can_tx::Message), 16, 4);
++K_MSGQ_DEFINE(user_can3_msgq,  sizeof(topic::to_can_tx::Message), 16, 4);  // 深度 16，4 字节对齐，满时 K_NO_WAIT 直接丢帧
+ 
+ 
+diff --git a/to_can_tx/to_can_tx.hpp b/to_can_tx/to_can_tx.hpp
+index 44d91e9..e6b1063 100644
+--- a/to_can_tx/to_can_tx.hpp
++++ b/to_can_tx/to_can_tx.hpp
+@@ -15,6 +15,8 @@
+ #include <zephyr/kernel.h>
+ 
+ extern struct k_msgq user_can1_msgq;
++extern struct k_msgq user_can3_msgq;
++
+ 
+ namespace topic::to_can_tx {
+ 
+-- 
+2.53.0
+
