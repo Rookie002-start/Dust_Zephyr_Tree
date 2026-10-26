@@ -1,4 +1,4 @@
-# zephyr_user — 子树架构总览
+# Dust_Zephyr_Tree（本地目录 `zephyr_user`）— 子树架构总览
 
 > 面向 dust 战队内部成员。本架构依附于 zephyr 树，是一套**子树系统架构**，通过维护者↔使用者的
 > 上下级管理关系，保证成员在共同架构上各自发展、又不会后期分叉成互不相通的多个版本。
@@ -9,7 +9,7 @@
 
 ```text
 zephyr_user/
-├── boards/      用户自研板卡（zephyr 树没有的板卡，如 stm32f407igh6）
+├── boards/      用户自研板卡（如 stm32f407igh6、stm32h723vgt6）
 ├── dts/         用户自研 devicetree binding
 ├── doc/         架构文档
 ├── framework/   架构普通目录（随本仓库统一版本管理）
@@ -23,8 +23,9 @@ zephyr_user/
 
 ### boards
 
-放置 zephyr 树未包含的板卡定义，只放**底层设备树**。例如 `boards/st/stm32f407igh6/`
-（rm_c 板的芯片型号）：板卡 dts、pinctrl、defconfig、board.cmake、烧录配置。具体内容以真实文件为准。
+放置 zephyr 树未包含的板卡定义，只放**底层设备树**。当前包括
+`boards/st/stm32f407igh6/` 和上下板共用的 `boards/st/stm32h723vgt6/`：
+板卡 dts、pinctrl、defconfig、board.cmake、烧录配置和共享板级源码。
 
 ### dts
 
@@ -35,22 +36,23 @@ zephyr_user/
 
 放置架构文档：
 
-- `zephyr_子树架构搭建指南.md` — 从零搭建纯 zephyr 子树环境
-- `zephyr_HPM_搭建指南.md` — 在子树基础上添加 HPM SDK
-- `zephyr_HPM_底层修改.md` — HPM 底层运行时 bug 修复（直接贴代码）
-- `子树架构描述.md` — 每层是干什么的 + 配置规范 + 维护者/使用者关系
+- `zephyr_子树架构搭建指南.md` — 从零搭建 Zephyr 子树环境
+- `zephyr_HPM_搭建指南.md` — HPM5300 平台接入
+- `zephyr_HPM5E3Y_搭建指南.md` — HPM5E3Y 平台接入
+- `zephyr_HPM_底层修改.md` — HPM 底层修改说明
+- `submodule-history/` — 原架构子模块转普通目录时的提交留档
 
 ### framework
 
 放置**架构层普通目录**（`drivers` `algorithm` `modules` `topic` `cmd` `init`）。
 这些目录已经并入 `Dust_Zephyr_Tree` 单仓库，不再需要 `git submodule` 初始化。
 **使用者不允许修改**公共架构内容；有 bug 或新需求，向维护者提 issue，或在自己的工作区单独维护
-（见 `子树架构描述.md` §6.6）。
+并在产品仓库中实现差异。
 
 ### platform
 
 放置**平台中间层**支持。当前为 `platform/cmsis`：ARM CMSIS 兼容垫片（`cmsis_core.h` 遮蔽 +
-`HAS_CMSIS_CORE` 符号），解决 Zephyr v4.3 与 CMSIS 新旧命名差异。
+`HAS_CMSIS_CORE` 符号），解决 Zephyr v4.4.1 与 CMSIS 新旧命名差异。
 
 ### project
 
@@ -133,6 +135,13 @@ dust build hpm5361icb -p       # 全编译（pristine）
 `hpm5361icb` 指 `project\boards\hpm\hpm5361icb\hpm5361icb.overlay`。脚本会顺着文件目录循环查找
 是否有符合该名字的设备树进行编译，因此这是**支持所有板卡**的架构，理论上可实现统一逻辑在不同板卡运行。
 
+Linux 下应用仓库直接使用 West。例如：
+
+```bash
+cd ~/zephyrproject/projects/Dust_Infantry_Body
+west build -p always -b stm32h723vgt6 -d build -- -DBOARD_CFG=board_dm_mc02
+```
+
 ### 板卡设备树节点命名
 
 不同板卡的设备树节点命名有讲究，都用**通用名**，减少对物理外设的耦合。以
@@ -173,7 +182,7 @@ Zephyr\projects\temp\
 **第一阶段 · 读架构文档**（先理解每层是干什么的）：
 
 1. `README.md` — 子树总览
-2. `子树架构描述.md` — 每层职责、配置规范、维护者/使用者关系
+2. `doc/` — 搭建记录、HPM 移植和原架构说明
 3. `framework/init` → `framework/cmd` → `framework/topic` → `framework/algorithm` → `framework/drivers` → `framework/modules`
    各自的 `ARCHITECTURE.md` 和 `README.md`
 
