@@ -1,0 +1,20 @@
+identifier: stm32h723vgt6
+name: Custom STM32H723VGT6 Board
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+ram: 564
+flash: 1024
+supported:
+  - can
+  - uart
+  - gpio
+  - spi
+  - i2c
+  - usb_device
+  - pwm
+  - adc
+  - counter
+vendor: st

@@ -1,0 +1,6 @@
+# Copyright (c) 2026 blinky project
+# SPDX-License-Identifier: Apache-2.0
+
+# Custom board for STM32H723VGT6
+config BOARD_STM32H723VGT6
+	select SOC_STM32H723XX
