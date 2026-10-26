@@ -180,3 +180,25 @@ Zephyr\projects\temp\
 
 1. `project` 源码 — 业务装配入口
 2. `framework/init` → `framework/cmd` → `framework/topic` → `framework/algorithm` → `framework/drivers` → `framework/modules` 源码
+
+---
+
+## 社区仓库补丁
+
+本仓库通过 `patches/` 保存必须应用到社区 Zephyr 的修改，社区仓库本身继续
+使用官方 `origin`，不维护完整 fork。
+
+当前基线为 Zephyr `v4.4.1`，补丁位于
+`patches/zephyr/0001-zephyr-v4.4.1-local.diff`。在干净 Zephyr 上执行：
+
+```bash
+./patches/apply-zephyr-patches.sh --zephyr ~/zephyrproject/zephyr
+```
+
+只验证、不修改：
+
+```bash
+./patches/apply-zephyr-patches.sh \
+  --zephyr ~/zephyrproject/zephyr \
+  --check
+```

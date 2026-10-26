@@ -1,0 +1,1134 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c0cbd8e598984e08f1b1698e80fb19cbb6078ea4..cb83d936ced3960d39e4f92a1426e2f8dde28477 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,15 @@ CMAKE_CACHEFILE_DIR: ${CMAKE_CACHEFILE_DIR}
+ ")
+ endif()
+ 
++# Guard against being re-processed as a module subdirectory.
++# The zephyrproject module's cmake_dir points back to ZEPHYR_BASE,
++# which would cause duplicate targets. Skip if we're in a module context
++# and the module dir equals ZEPHYR_BASE.
++if(DEFINED ZEPHYR_CURRENT_MODULE_DIR AND ZEPHYR_CURRENT_MODULE_DIR)
++  if(${ZEPHYR_BASE} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
++    return()
++  endif()
++endif()
+ 
+ # See https://gitlab.kitware.com/cmake/cmake/issues/16228
+ # and https://cmake.org/pipermail/cmake/2019-May/thread.html#69496
+diff --git a/boards/st/damiao_mc02/CMakeLists.txt b/boards/st/damiao_mc02/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7dc863f9b2e0d8956a80f2a597da04b6d7028ee1
+--- /dev/null
++++ b/boards/st/damiao_mc02/CMakeLists.txt
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: Apache-2.0
++
++zephyr_library()
++zephyr_library_sources(board_debug.c)
+diff --git a/boards/st/damiao_mc02/Kconfig.damiao_mc02 b/boards/st/damiao_mc02/Kconfig.damiao_mc02
+new file mode 100644
+index 0000000000000000000000000000000000000000..a012c399e13d55d2ce7318e48a3031b1c0f5691a
+--- /dev/null
++++ b/boards/st/damiao_mc02/Kconfig.damiao_mc02
+@@ -0,0 +1,6 @@
++# Damiao MC02 board configuration
++# Copyright (c) 2024
++# SPDX-License-Identifier: Apache-2.0
++
++config BOARD_DAMIAO_MC02
++	select SOC_STM32H723XX
+diff --git a/boards/st/damiao_mc02/Kconfig.defconfig b/boards/st/damiao_mc02/Kconfig.defconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f7bd620399cdcbfcb849a8ad67154ed3424f96b
+--- /dev/null
++++ b/boards/st/damiao_mc02/Kconfig.defconfig
+@@ -0,0 +1,10 @@
++# Damiao MC02 board configuration
++# Copyright (c) 2024
++# SPDX-License-Identifier: Apache-2.0
++
++if BOARD_DAMIAO_MC02
++
++config NET_L2_ETHERNET
++	default n
++
++endif # BOARD_DAMIAO_MC02
+diff --git a/boards/st/damiao_mc02/board.cmake b/boards/st/damiao_mc02/board.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fcc8963e9fed4f3f562d3a7ec4c738d11894ef8
+--- /dev/null
++++ b/boards/st/damiao_mc02/board.cmake
+@@ -0,0 +1,28 @@
++# SPDX-License-Identifier: Apache-2.0
++
++# keep first
++board_runner_args(jlink "--device=STM32H723VG" "--speed=4000")
++board_runner_args(openocd --target-handle=_CHIPNAME.cpu0)
++
++# Select OpenOCD debugger interface
++#   cmake -DOPENOCD_INTERFACE=stlink   (default, ST-Link via HLA mode)
++#   cmake -DOPENOCD_INTERFACE=dap-cmsis (CMSIS-DAP / DAPLink)
++if(NOT OPENOCD_INTERFACE)
++  set(OPENOCD_INTERFACE "stlink")
++endif()
++
++if(OPENOCD_INTERFACE STREQUAL "dap-cmsis")
++  board_runner_args(openocd "--config=${BOARD_DIR}/support/openocd_dap.cfg")
++  # Use wrapper script to work around USB/firmware issue with Horco CMSIS-DAP
++  # The wrapper resets the USB device and unbinds cdc_acm before running openocd
++  set(OPENOCD "${BOARD_DIR}/support/openocd-cmsis-dap-wrapper.sh"
++      CACHE FILEPATH "OpenOCD wrapper for CMSIS-DAP" FORCE)
++else()
++  board_runner_args(openocd "--config=${BOARD_DIR}/support/openocd_stlink.cfg")
++  # Reset OPENOCD to system default (not the CMSIS-DAP wrapper)
++  unset(OPENOCD CACHE)
++endif()
++
++# keep first
++include(${ZEPHYR_BASE}/boards/common/openocd-stm32.board.cmake)
++include(${ZEPHYR_BASE}/boards/common/jlink.board.cmake)
+diff --git a/boards/st/damiao_mc02/board.yml b/boards/st/damiao_mc02/board.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..20a520baf202e252a753571a9f0c4c7349b8c014
+--- /dev/null
++++ b/boards/st/damiao_mc02/board.yml
+@@ -0,0 +1,6 @@
++board:
++  name: damiao_mc02
++  full_name: Damiao MC02
++  vendor: damiao
++  socs:
++    - name: stm32h723xx
+diff --git a/boards/st/damiao_mc02/board_debug.c b/boards/st/damiao_mc02/board_debug.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..191ea247c472ee13cb7c77a1ae16404e175e7c4d
+--- /dev/null
++++ b/boards/st/damiao_mc02/board_debug.c
+@@ -0,0 +1,31 @@
++/*
++ * Damiao MC02 board - debug connectivity fix
++ *
++ * Direct register writes to DBGMCU, no HAL function dependency.
++ * DBGMCU base: 0x5C001000 (STM32H7 D3 domain)
++ * CR offset 0x004:
++ *   bit 22 = D1DBGCKEN (0x00400000)
++ *   bit 21 = D3DBGCKEN (0x00200000)
++ *   bit  1 = DBG_STOP_D1 (0x00000002)
++ *   bit  0 = DBG_SLEEP_D1 (0x00000001)
++ *
++ * Copyright (c) 2024
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <zephyr/init.h>
++
++#define DBGMCU_BASE  0x5C001000UL
++#define DBGMCU_CR    (*(volatile uint32_t *)(DBGMCU_BASE + 0x004))
++
++/* Bits we need: D1 debug clock + D3 debug clock + sleep debug + stop debug */
++#define DBGMCU_CR_NEEDED  (0x00400000U | 0x00200000U | 0x00000002U | 0x00000001U)
++
++static int mc02_debug_init(void)
++{
++	DBGMCU_CR |= DBGMCU_CR_NEEDED;
++	return 0;
++}
++
++/* Priority 2: runs AFTER soc_config.c (PRE_KERNEL_1 prio 1) */
++SYS_INIT(mc02_debug_init, PRE_KERNEL_1, 2);
+diff --git a/boards/st/damiao_mc02/damiao_mc02.dts b/boards/st/damiao_mc02/damiao_mc02.dts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb1bbbf39ce62a954d97fb80aa226e64d945e0c5
+--- /dev/null
++++ b/boards/st/damiao_mc02/damiao_mc02.dts
+@@ -0,0 +1,259 @@
++/*
++ * Copyright (c) 2024
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Damiao MC02 board device tree
++ * Based on STM32H723VGT6 (LQFP100, 1MB Flash, 564KB RAM)
++ *
++ * WARNING: Pin assignments below are based on typical STM32H723 configurations
++ * and known MC02 peripheral descriptions. VERIFY against actual schematics!
++ */
++
++/dts-v1/;
++#include <st/h7/stm32h723Xg.dtsi>
++#include <st/h7/stm32h723vgtx-pinctrl.dtsi>
++#include <zephyr/dt-bindings/input/input-event-codes.h>
++
++/ {
++	model = "Damiao MC02 Board (STM32H723VGT6)";
++	compatible = "damiao,mc02";
++
++	chosen {
++		/*
++		 * TODO: Verify console UART pins. MC02 has 3 UARTs.
++		 * Common choices: USART1 on PA9/PA10, USART3 on PB10/PB11
++		 * Using USB CDC ACM for console is also common on this board.
++		 */
++		zephyr,console = &usart1;
++		zephyr,shell-uart = &usart1;
++		zephyr,dtcm = &dtcm;
++		zephyr,sram = &sram0;
++		zephyr,flash = &flash0;
++	};
++
++	leds: leds {
++		compatible = "gpio-leds";
++		/*
++		 * TODO: MC02 has a WS2812 smart LED (not a simple GPIO LED).
++		 * WS2812 needs a timer+DMA for control (e.g., SPI MOSI or TIM PWM).
++		 * This placeholder LED node is for basic GPIO test.
++		 * Verify the actual user LED GPIO pin from schematics.
++		 */
++		user_led: led_0 {
++			gpios = <&gpioc 13 GPIO_ACTIVE_HIGH>;
++			label = "User LED";
++		};
++	};
++
++	gpio_keys {
++		compatible = "gpio-keys";
++		/*
++		 * TODO: MC02 has 2 buttons (reset + user).
++		 * Reset is typically NRST (hardware), user button needs verification.
++		 */
++		user_button: button_0 {
++			label = "User Button";
++			gpios = <&gpioc 14 GPIO_ACTIVE_LOW>;
++			zephyr,code = <INPUT_KEY_0>;
++		};
++	};
++
++	aliases {
++		led0 = &user_led;
++		sw0 = &user_button;
++	};
++};
++
++/*
++ * Clock configuration
++ * HSE = 24MHz crystal → PLL = 480MHz system clock
++ * VCO = 24 / 6 * 120 = 480MHz
++ */
++&clk_lsi {
++	status = "okay";
++};
++
++&clk_hsi48 {
++	status = "okay";
++};
++
++&clk_hse {
++	clock-frequency = <DT_FREQ_M(24)>;
++	status = "okay";
++};
++
++&clk_lse {
++	status = "disabled";
++};
++
++&pll {
++	div-m = <6>;
++	mul-n = <120>;
++	div-p = <1>;
++	div-q = <4>;
++	div-r = <2>;
++	clocks = <&clk_hse>;
++	status = "okay";
++};
++
++&pll2 {
++	div-m = <3>;
++	mul-n = <10>;
++	div-p = <1>;
++	div-q = <1>;
++	div-r = <1>;
++	clocks = <&clk_hse>;
++	status = "okay";
++};
++
++&rcc {
++	clocks = <&pll>;
++	clock-frequency = <DT_FREQ_M(480)>;
++	d1cpre = <1>;
++	hpre = <2>;    /* HCLK: 240 MHz */
++	d1ppre = <2>;  /* APB1: 120 MHz */
++	d2ppre1 = <2>; /* APB2: 120 MHz */
++	d2ppre2 = <2>; /* APB3: 120 MHz */
++	d3ppre = <2>;  /* APB4: 120 MHz */
++};
++
++&pwr {
++	power-supply = "ldo";
++};
++
++/*
++ * Console USART1 - PA9(TX) / PA10(RX)
++ * TODO: Verify console UART pins from schematics.
++ * MC02 has 3 UARTs - which is used for debug console?
++ */
++&usart1 {
++	pinctrl-0 = <&usart1_tx_pa9 &usart1_rx_pa10>;
++	pinctrl-names = "default";
++	current-speed = <115200>;
++	status = "okay";
++};
++
++/*
++ * USART2 - Commonly available on MC02 expansion header
++ * TODO: Verify pin assignment
++ */
++&usart2 {
++	pinctrl-0 = <&usart2_tx_pa2 &usart2_rx_pa3>;
++	pinctrl-names = "default";
++	current-speed = <115200>;
++	status = "disabled";
++};
++
++/*
++ * USART3 - Commonly available on MC02
++ * TODO: Verify pin assignment
++ */
++&usart3 {
++	pinctrl-0 = <&usart3_tx_pb10 &usart3_rx_pb11>;
++	pinctrl-names = "default";
++	current-speed = <115200>;
++	status = "disabled";
++};
++
++&rtc {
++	clocks = <&rcc STM32_CLOCK(APB4, 16)>,
++		 <&rcc STM32_SRC_LSI RTC_SEL(2)>;
++	status = "okay";
++};
++
++/*
++ * I2C1 - Available on MC02 (LCD uses SPI+I2C, BMI088 may use I2C)
++ * TODO: Verify pin assignment
++ */
++&i2c1 {
++	pinctrl-0 = <&i2c1_scl_pb8 &i2c1_sda_pb9>;
++	pinctrl-names = "default";
++	status = "okay";
++	clock-frequency = <I2C_BITRATE_FAST>;
++};
++
++/*
++ * SPI1 - Available on MC02 (BMI088 IMU, LCD, external SPI devices)
++ * TODO: Verify pin assignment for CS pins
++ */
++&spi1 {
++	status = "okay";
++	pinctrl-0 = <&spi1_sck_pa5 &spi1_miso_pa6 &spi1_mosi_pb5>;
++	pinctrl-names = "default";
++	cs-gpios = <&gpioa 4 GPIO_ACTIVE_LOW>; /* TODO: Verify CS pin */
++};
++
++/*
++ * SPI2 - May be used for IMU or external SPI devices
++ * TODO: Verify if used on MC02
++ */
++&spi2 {
++	status = "disabled";
++	pinctrl-0 = <&spi2_sck_pb13 &spi2_miso_pb14 &spi2_mosi_pb15>;
++	pinctrl-names = "default";
++};
++
++/*
++ * CANFD1 - MC02 has 3 CANFD interfaces
++ * TODO: Verify pin assignment for all 3 CANFD interfaces
++ */
++&fdcan1 {
++	pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>;
++	pinctrl-names = "default";
++	clocks = <&rcc STM32_CLOCK(APB1_2, 8)>,
++		 <&rcc STM32_SRC_PLL2_Q FDCAN_SEL(2)>;
++	status = "okay";
++};
++
++/*
++ * FDCAN2 - Second CANFD interface
++ * TODO: Verify pin assignment
++ */
++&fdcan2 {
++	pinctrl-0 = <&fdcan2_rx_pb12 &fdcan2_tx_pb13>;
++	pinctrl-names = "default";
++	clocks = <&rcc STM32_CLOCK(APB1_2, 8)>,
++		 <&rcc STM32_SRC_PLL2_Q FDCAN_SEL(2)>;
++	status = "disabled";
++};
++
++/*
++ * USB OTG HS (used as Full-Speed device on MC02)
++ * MC02 has 1 USB interface
++ * TODO: Verify USB pins (DP=PA12, DM=PA11 are standard for FS)
++ */
++zephyr_udc0: &usbotg_hs {
++	pinctrl-0 = <&usb_otg_hs_dm_pa11 &usb_otg_hs_dp_pa12>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++&rng {
++	status = "okay";
++};
++
++/*
++ * ADC - Available on MC02
++ * TODO: Configure ADC channels when needed.
++ * Required properties: st,adc-clock-source, st,adc-prescaler,
++ * st,adc-resolutions, sampling-times
++ */
++/* &adc1 { status = "okay"; }; */
++
++/*
++ * PWM / Timers for servo interface (MC02 has 4 PWM outputs)
++ * TODO: Configure timer PWM channels based on actual pin assignments
++ * These are commonly on TIM1/2/3/4/5/8 channels
++ */
++
++/*
++ * QSPI Flash - W25Q64JV (8MB) on MC02
++ * TODO: Configure QUADSPI pins and enable
++ */
++&quadspi {
++	status = "disabled";
++};
++
++&backup_sram {
++	status = "okay";
++};
+diff --git a/boards/st/damiao_mc02/damiao_mc02.yaml b/boards/st/damiao_mc02/damiao_mc02.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..af23f5613c4502e3435a880a5130787f3305ca04
+--- /dev/null
++++ b/boards/st/damiao_mc02/damiao_mc02.yaml
+@@ -0,0 +1,22 @@
++identifier: damiao_mc02
++name: Damiao MC02
++type: mcu
++arch: arm
++toolchain:
++  - zephyr
++  - gnuarmemb
++ram: 564
++flash: 1024
++supported:
++  - uart
++  - gpio
++  - i2c
++  - spi
++  - pwm
++  - can
++  - usb_device
++  - rtc
++  - adc
++  - dac
++  - counter
++vendor: damiao
+diff --git a/boards/st/damiao_mc02/damiao_mc02_defconfig b/boards/st/damiao_mc02/damiao_mc02_defconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..0915a1755f4b9e7f9ce2599e87a718ce00c6227e
+--- /dev/null
++++ b/boards/st/damiao_mc02/damiao_mc02_defconfig
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: Apache-2.0
++
++# Enable MPU
++CONFIG_ARM_MPU=y
++
++# Enable HW stack protection
++CONFIG_HW_STACK_PROTECTION=y
++
++# Enable UART
++CONFIG_SERIAL=y
++
++# Console
++CONFIG_CONSOLE=y
++CONFIG_UART_CONSOLE=y
++
++# Enable GPIO
++CONFIG_GPIO=y
++
++# Keep debug interface alive during sleep (prevent flash lock-out)
++CONFIG_STM32_ENABLE_DEBUG_SLEEP_STOP=y
+diff --git a/boards/st/damiao_mc02/support/openocd-cmsis-dap-wrapper.sh b/boards/st/damiao_mc02/support/openocd-cmsis-dap-wrapper.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..efc0b01862ec379a8f91feebf4a8db82f1d779f8
+--- /dev/null
++++ b/boards/st/damiao_mc02/support/openocd-cmsis-dap-wrapper.sh
+@@ -0,0 +1,130 @@
++#!/bin/bash
++# CMSIS-DAP OpenOCD wrapper for Horco CMSIS-DAP debugger (VID:PID=faed:4873)
++#
++# Workarounds:
++# 1. Kills stale OpenOCD processes left by cortex-debug or previous sessions
++# 2. Resets USB device to recover from firmware lockup after cdc_acm binds
++# 3. Unbinds cdc_acm before OpenOCD, rebinds after it exits
++#
++# Usage: Set OPENOCD=/path/to/this/script in cmake or environment
++#        The script passes all arguments through to the real openocd.
++
++REAL_OPENOCD="/home/rookie/zephyrproject/zephyr-sdk-1.0.1/hosttools/sysroots/x86_64-pokysdk-linux/usr/bin/openocd"
++VID="faed"
++PIDS="4870 4873"
++USB_DEV=""
++
++# Auto-detect the USB device path
++auto_detect_device() {
++    for dev in /sys/bus/usb/devices/*/; do
++        [ "$(cat "$dev/idVendor" 2>/dev/null)" = "$VID" ] || continue
++        for pid in $PIDS; do
++            if [ "$(cat "$dev/idProduct" 2>/dev/null)" = "$pid" ]; then
++                USB_DEV=$(basename "$dev")
++                return 0
++            fi
++        done
++    done
++    return 1
++}
++
++# Kill any stale OpenOCD processes still holding the USB device
++kill_stale_openocd() {
++    local killed=0
++    # Find openocd processes
++    for pid in $(pgrep -x "openocd" 2>/dev/null); do
++        # Check if this process has our USB device open
++        if lsof -p "$pid" 2>/dev/null | grep -q "/dev/bus/usb"; then
++            echo "[wrapper] Killing stale openocd (pid=$pid)..."
++            kill "$pid" 2>/dev/null || true
++            killed=1
++        fi
++    done
++    if [ "$killed" = "1" ]; then
++        # Wait for USB interface to be released
++        sleep 1
++    fi
++}
++
++# Release the USB interface from any kernel driver (not just cdc_acm)
++release_usb_interface() {
++    local iface_path="$1"
++    local driver
++    driver=$(readlink "$iface_path/driver" 2>/dev/null)
++    if [ -n "$driver" ]; then
++        local drv_name iface_name
++        drv_name=$(basename "$driver")
++        iface_name=$(basename "$iface_path")
++        echo "[wrapper] Unbinding $iface_name from $drv_name..."
++        echo -n "$USB_DEV:$iface_name" | sudo tee "/sys/bus/usb/drivers/$drv_name/unbind" >/dev/null 2>&1 || true
++        return 0
++    fi
++    return 1
++}
++
++setup_device() {
++    # Step 0: Kill any stale openocd holding the device
++    kill_stale_openocd
++
++    if ! auto_detect_device; then
++        echo "[wrapper] CMSIS-DAP device (${VID}:${PID}) not found, running openocd directly..."
++        exec "$REAL_OPENOCD" "$@"
++    fi
++    echo "[wrapper] Found CMSIS-DAP device at $USB_DEV"
++
++    # Step 1: Save which interfaces had cdc_acm bound (for later rebind)
++    NEED_REBIND=""
++    for iface_path in "/sys/bus/usb/devices/$USB_DEV/${USB_DEV}:"*; do
++        [ -d "$iface_path" ] || continue
++        local iface driver
++        iface=$(basename "$iface_path")
++        driver=$(readlink "$iface_path/driver" 2>/dev/null || true)
++        if echo "$driver" | grep -q "cdc_acm"; then
++            NEED_REBIND="$NEED_REBIND $iface"
++        fi
++    done
++
++    # Step 2: USB device hard reset
++    echo "[wrapper] Resetting USB device..."
++    echo -n "0" | sudo tee "/sys/bus/usb/devices/$USB_DEV/authorized" >/dev/null 2>&1 || true
++    sleep 1
++    echo -n "1" | sudo tee "/sys/bus/usb/devices/$USB_DEV/authorized" >/dev/null 2>&1 || true
++    sleep 2
++
++    # Step 3: Wait for device to fully re-enumerate
++    for i in $(seq 1 10); do
++        if [ -e "/sys/bus/usb/devices/$USB_DEV/idVendor" ]; then
++            break
++        fi
++        sleep 0.5
++    done
++
++    # Step 4: Unbind cdc_acm (and any other kernel driver) from all interfaces
++    for iface_path in "/sys/bus/usb/devices/$USB_DEV/${USB_DEV}:"*; do
++        [ -d "$iface_path" ] || continue
++        release_usb_interface "$iface_path"
++    done
++    sleep 0.5
++}
++
++cleanup_device() {
++    [ -n "$USB_DEV" ] || return
++    [ -n "$NEED_REBIND" ] || return
++
++    echo "[wrapper] Rebinding cdc_acm..."
++    for iface in $NEED_REBIND; do
++        if [ ! -L "/sys/bus/usb/devices/$USB_DEV/$iface/driver" ]; then
++            echo -n "$USB_DEV:$iface" | sudo tee "/sys/bus/usb/drivers/cdc_acm/bind" >/dev/null 2>&1 || true
++        fi
++    done
++}
++
++# Main
++setup_device "$@"
++
++# Run the real openocd
++"$REAL_OPENOCD" "$@"
++RET=$?
++
++cleanup_device
++exit $RET
+diff --git a/boards/st/damiao_mc02/support/openocd.cfg b/boards/st/damiao_mc02/support/openocd.cfg
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ea79c1e07e1b301b27f95d2b228adf2adc18b38
+--- /dev/null
++++ b/boards/st/damiao_mc02/support/openocd.cfg
+@@ -0,0 +1,40 @@
++# Damiao MC02 board OpenOCD ST-LINK configuration (default)
++#
++# For CMSIS-DAP / DAPLink, use openocd_dap.cfg instead.
++# The build system auto-selects via: cmake -DOPENOCD_INTERFACE=dap-cmsis
++#
++# MC02 SWD port: 4-pin (VCC/GND/SWDIO/SWCLK), no NRST.
++# Uses HLA mode (interface/stlink.cfg) - DAP mode has AHB-AP issues
++# on this board when CPU is running.
++#
++# Key fix: stm32h7x.cfg's examine-end handler accesses DBGMCU via AHB-AP
++# while CPU is running, which fails on MC02. We suppress it and set
++# DBGMCU bits in reset-init instead (CPU is halted at that point).
++#
++# Copyright (c) 2024
++# SPDX-License-Identifier: Apache-2.0
++
++source [find interface/stlink.cfg]
++transport select hla_swd
++
++set WORKAREASIZE 0x3000
++set CHIPNAME STM32H723VG
++set BOARDNAME DAMIAO-MC02
++
++source [find target/stm32h7x.cfg]
++
++adapter speed 1000
++
++# Suppress examine-end - DBGMCU access fails on running CPU
++$_CHIPNAME.cpu0 configure -event examine-end {}
++
++# Set DBGMCU bits when CPU is halted (during reset-init)
++$_CHIPNAME.cpu0 configure -event reset-init {
++    # Enable D3 and D1 DBG clocks
++    stm32h7x_dbgmcu_mmw 0x004 0x00600000 0
++    # Enable debug during low power modes D1
++    stm32h7x_dbgmcu_mmw 0x004 0x00000007 0
++    # Enable debug during low power modes D2
++    stm32h7x_dbgmcu_mmw 0x004 0x00000038 0
++    adapter speed 4000
++}
+diff --git a/boards/st/damiao_mc02/support/openocd_dap.cfg b/boards/st/damiao_mc02/support/openocd_dap.cfg
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b1c239fd92eaaa20c7810630aebdf9b7cd171ac
+--- /dev/null
++++ b/boards/st/damiao_mc02/support/openocd_dap.cfg
+@@ -0,0 +1,36 @@
++# Damiao MC02 board OpenOCD CMSIS-DAP configuration
++#
++# MC02 SWD port: 4-pin (VCC/GND/SWDIO/SWCLK), no NRST.
++# Uses standard CMSIS-DAP (DAPLink / ARM Debug Interface) mode.
++#
++# Unlike ST-Link HLA mode, CMSIS-DAP uses the standard ARM ADI (v5/v6)
++# which generally handles AHB-AP access more reliably.
++#
++# Copyright (c) 2024
++# SPDX-License-Identifier: Apache-2.0
++
++source [find interface/cmsis-dap.cfg]
++cmsis_dap_vid_pid 0xfaed 0x4873
++transport select swd
++
++set WORKAREASIZE 0x3000
++set CHIPNAME STM32H723VG
++set BOARDNAME DAMIAO-MC02
++
++source [find target/stm32h7x.cfg]
++
++adapter speed 1000
++
++# Suppress examine-end - DBGMCU access can fail on running CPU
++$_CHIPNAME.cpu0 configure -event examine-end {}
++
++# Set DBGMCU bits when CPU is halted (during reset-init)
++$_CHIPNAME.cpu0 configure -event reset-init {
++    # Enable D3 and D1 DBG clocks
++    stm32h7x_dbgmcu_mmw 0x004 0x00600000 0
++    # Enable debug during low power modes D1
++    stm32h7x_dbgmcu_mmw 0x004 0x00000007 0
++    # Enable debug during low power modes D2
++    stm32h7x_dbgmcu_mmw 0x004 0x00000038 0
++    adapter speed 4000
++}
+diff --git a/boards/st/damiao_mc02/support/openocd_stlink.cfg b/boards/st/damiao_mc02/support/openocd_stlink.cfg
+new file mode 100644
+index 0000000000000000000000000000000000000000..9455dea6eb51296725f1234f6b18e4452a8b68c6
+--- /dev/null
++++ b/boards/st/damiao_mc02/support/openocd_stlink.cfg
+@@ -0,0 +1,37 @@
++# Damiao MC02 board OpenOCD ST-LINK configuration
++#
++# MC02 SWD port: 4-pin (VCC/GND/SWDIO/SWCLK), no NRST.
++# Uses HLA mode (interface/stlink.cfg) - DAP mode has AHB-AP issues
++# on this board when CPU is running.
++#
++# Key fix: stm32h7x.cfg's examine-end handler accesses DBGMCU via AHB-AP
++# while CPU is running, which fails on MC02. We suppress it and set
++# DBGMCU bits in reset-init instead (CPU is halted at that point).
++#
++# Copyright (c) 2024
++# SPDX-License-Identifier: Apache-2.0
++
++source [find interface/stlink.cfg]
++transport select hla_swd
++
++set WORKAREASIZE 0x3000
++set CHIPNAME STM32H723VG
++set BOARDNAME DAMIAO-MC02
++
++source [find target/stm32h7x.cfg]
++
++adapter speed 1000
++
++# Suppress examine-end - DBGMCU access fails on running CPU
++$_CHIPNAME.cpu0 configure -event examine-end {}
++
++# Set DBGMCU bits when CPU is halted (during reset-init)
++$_CHIPNAME.cpu0 configure -event reset-init {
++    # Enable D3 and D1 DBG clocks
++    stm32h7x_dbgmcu_mmw 0x004 0x00600000 0
++    # Enable debug during low power modes D1
++    stm32h7x_dbgmcu_mmw 0x004 0x00000007 0
++    # Enable debug during low power modes D2
++    stm32h7x_dbgmcu_mmw 0x004 0x00000038 0
++    adapter speed 4000
++}
+diff --git a/drivers/interrupt_controller/intc_plic.c b/drivers/interrupt_controller/intc_plic.c
+index 95523c9638959341fecd7e12223d1279f94819ec..12adc1d0e323c1142d1a8e0882a50bf728c7fc9b 100644
+--- a/drivers/interrupt_controller/intc_plic.c
++++ b/drivers/interrupt_controller/intc_plic.c
+@@ -23,7 +23,6 @@
+ #include <zephyr/device.h>
+ #include <zephyr/devicetree/interrupt_controller.h>
+ #include <zephyr/shell/shell.h>
+-
+ #include <zephyr/sw_isr_table.h>
+ #include <zephyr/drivers/interrupt_controller/riscv_plic.h>
+ #include <zephyr/irq.h>
+@@ -567,6 +566,16 @@ static void plic_irq_handler(const struct device *dev)
+ 
+ 	/* Call the corresponding IRQ handler in _sw_isr_table */
+ 	ite = &config->isr_table[local_irq];
++	if (ite->isr == z_irq_spurious) {
++#ifdef CONFIG_PLIC_SUPPORTS_TRIG_EDGE
++		if (trig_val == PLIC_TRIG_LEVEL) {
++			sys_write32(local_irq, claim_complete_addr);
++		}
++#else
++		sys_write32(local_irq, claim_complete_addr);
++#endif
++		return;
++	}
+ 	ite->isr(ite->arg);
+ 
+ 	/*
+diff --git a/drivers/pwm/pwm_stm32.c b/drivers/pwm/pwm_stm32.c
+index b6c2f16b9a1e9cee95e4181d3917b8a36cd4ed3e..416f46a31ddf8dae0d5cc6b2f0801509fcae16a5 100644
+--- a/drivers/pwm/pwm_stm32.c
++++ b/drivers/pwm/pwm_stm32.c
+@@ -667,6 +667,8 @@ static DEVICE_API(pwm, pwm_stm32_driver_api) = {
+ #endif /* CONFIG_PWM_CAPTURE */
+ };
+ 
++
++
+ static int pwm_stm32_init(const struct device *dev)
+ {
+ 	struct pwm_stm32_data *data = dev->data;
+diff --git a/drivers/spi/spi_stm32.c b/drivers/spi/spi_stm32.c
+index 5f134e6c681c73e9a91159b52d52cda106f12e45..84c47c014798e63505641d5de85cbdd95079cb8e 100644
+--- a/drivers/spi/spi_stm32.c
++++ b/drivers/spi/spi_stm32.c
+@@ -2370,6 +2370,8 @@ static int spi_stm32_pm_action(const struct device *dev, enum pm_device_action a
+ 	return 0;
+ }
+ 
++
++
+ static int spi_stm32_init(const struct device *dev)
+ {
+ 	struct spi_stm32_data *data __attribute__((unused)) = dev->data;
+diff --git a/modules/cmsis/CMakeLists.txt b/modules/cmsis/CMakeLists.txt
+index 4044ae891b39285a76849f779da3c87f347739af..e7608c45fa7899524baca4bb65d50e413576d023 100644
+--- a/modules/cmsis/CMakeLists.txt
++++ b/modules/cmsis/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ # Copyright (c) 2023 Nordic Semiconductor ASA
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-if(CONFIG_CPU_AARCH32_CORTEX_A OR CONFIG_CPU_AARCH32_CORTEX_R)
++if(CONFIG_CPU_AARCH32_CORTEX_A OR CONFIG_CPU_AARCH32_CORTEX_R OR CONFIG_CPU_CORTEX_M)
+   add_subdirectory(${ZEPHYR_CURRENT_MODULE_DIR} cmsis)
+   zephyr_include_directories(.)
+ endif()
+diff --git a/modules/cmsis/Kconfig b/modules/cmsis/Kconfig
+index 9cc5ee7963043f63ccfed80a12d2beeeb9fad88c..4b5a8ee285570b816c0fad907ae7d9ed29af3ed3 100644
+--- a/modules/cmsis/Kconfig
++++ b/modules/cmsis/Kconfig
+@@ -8,6 +8,7 @@ config HAS_CMSIS_CORE
+ 	bool
+ 	select HAS_CMSIS_CORE_A if CPU_AARCH32_CORTEX_A
+ 	select HAS_CMSIS_CORE_R if CPU_AARCH32_CORTEX_R
++	select HAS_CMSIS_CORE_M if CPU_CORTEX_M
+ 
+ if HAS_CMSIS_CORE
+ 
+@@ -17,4 +18,7 @@ config HAS_CMSIS_CORE_A
+ config HAS_CMSIS_CORE_R
+ 	bool
+ 
++config HAS_CMSIS_CORE_M
++	bool
++
+ endif
+diff --git a/modules/cmsis/cmsis_core.h b/modules/cmsis/cmsis_core.h
+index b85533b56ae9a2b0a7e78301fcaebf57f6d5f54b..0e5be85007095e432f95fb7eb4133b4c8b722aa6 100644
+--- a/modules/cmsis/cmsis_core.h
++++ b/modules/cmsis/cmsis_core.h
+@@ -8,6 +8,8 @@
+ 
+ #if defined(CONFIG_CPU_AARCH32_CORTEX_A) || defined(CONFIG_CPU_AARCH32_CORTEX_R)
+ #include "cmsis_core_a_r.h"
++#elif defined(CONFIG_CPU_CORTEX_M)
++#include "cmsis_core_m.h"
+ #endif
+ 
+ #endif /* ZEPHYR_MODULES_CMSIS_CMSIS_H_ */
+diff --git a/modules/cmsis/cmsis_core_m.h b/modules/cmsis/cmsis_core_m.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4267b98ce5b990a336aef5b73b08154d5abfc92
+--- /dev/null
++++ b/modules/cmsis/cmsis_core_m.h
+@@ -0,0 +1,71 @@
++/*
++ * Copyright (c) 2017 Nordic Semiconductor ASA
++ * Copyright 2023,2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/**
++ * @file
++ * @brief CMSIS interface file
++ *
++ * This header contains the interface to the ARM CMSIS Core headers.
++ */
++
++#ifndef ZEPHYR_MODULES_CMSIS_CMSIS_CORE_M_H_
++#define ZEPHYR_MODULES_CMSIS_CMSIS_CORE_M_H_
++
++#if defined(CONFIG_CMSIS_M_CHECK_DEVICE_DEFINES) && CONFIG_CMSIS_M_CHECK_DEVICE_DEFINES == 1U
++#define __CHECK_DEVICE_DEFINES 1U
++#endif
++
++#include <zephyr/arch/arm/cortex_m/nvic.h>
++
++#include <soc.h>
++
++#if __NVIC_PRIO_BITS != NUM_IRQ_PRIO_BITS
++#error "NUM_IRQ_PRIO_BITS and __NVIC_PRIO_BITS are not set to the same value"
++#endif
++
++#if __MPU_PRESENT != CONFIG_CPU_HAS_ARM_MPU
++#error "__MPU_PRESENT and CONFIG_CPU_HAS_ARM_MPU are not set to the same value"
++#endif
++
++#if __FPU_PRESENT != CONFIG_CPU_HAS_FPU
++#error "__FPU_PRESENT and CONFIG_CPU_HAS_FPU are not set to the same value"
++#endif
++
++
++/* VTOR is only optional on armv6-m and armv8-m baseline. __VTOR_PRESENT is often
++ * left undefined on platform where it is not optional.
++ */
++#if defined(CONFIG_ARMV6_M_ARMV8_M_BASELINE) && \
++	(__VTOR_PRESENT != CONFIG_CPU_CORTEX_M_HAS_VTOR)
++#error "__VTOR_PRESENT and CONFIG_CPU_CORTEX_M_HAS_VTOR are not set to the same value."
++#endif
++
++/* Some platform's sdk incorrectly define __DSP_PRESENT for Cortex-M4 & Cortex-M7
++ * DSP extension. __ARM_FEATURE_DSP is set by the compiler for these. So ignore
++ * __DSP_PRESENT discrepancy when __ARM_FEATURE_DSP is defined.
++ */
++#if !defined(__ARM_FEATURE_DSP) && (__DSP_PRESENT != CONFIG_ARMV8_M_DSP)
++#error "__DSP_PRESENT and CONFIG_ARMV8_M_DSP are not set to the same value"
++#endif
++
++#if  defined(__ICACHE_PRESENT) && (__ICACHE_PRESENT != CONFIG_CPU_HAS_ICACHE)
++#error "__ICACHE_PRESENT and CONFIG_CPU_HAS_ICACHE are not set to the same value"
++#endif
++
++#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT != CONFIG_CPU_HAS_DCACHE)
++#error "__DCACHE_PRESENT and CONFIG_CPU_HAS_DCACHE are not set to the same value"
++#endif
++
++#if defined(__MVE_PRESENT) && (__MVE_PRESENT != CONFIG_ARMV8_1_M_MVEI)
++#error "__MVE_PRESENT and CONFIG_ARMV8_1_M_MVEI are not set to the same value"
++#endif
++
++#if defined(__SAUREGION_PRESENT) && (__SAUREGION_PRESENT != CONFIG_CPU_HAS_ARM_SAU)
++#error "__SAUREGION_PRESENT and CONFIG_CPU_HAS_ARM_SAU are not set to the same value"
++#endif
++
++#endif /* ZEPHYR_MODULES_CMSIS_CMSIS_CORE_M_H_ */
+diff --git a/modules/cmsis/cmsis_core_m_defaults.h b/modules/cmsis/cmsis_core_m_defaults.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..776e8681adf36f45c3166662b4ab278fe2b29583
+--- /dev/null
++++ b/modules/cmsis/cmsis_core_m_defaults.h
+@@ -0,0 +1,156 @@
++/*
++ * Copyright (c) 2017 Nordic Semiconductor ASA
++ * Copyright 2023,2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/**
++ * @file
++ * @brief CMSIS interface file
++ *
++ * This header populates the default values required to configure the
++ * ARM CMSIS Core headers.
++ */
++
++#ifndef ZEPHYR_MODULES_CMSIS_CMSIS_CORE_M_DEFAULTS_H_
++#define ZEPHYR_MODULES_CMSIS_CMSIS_CORE_M_DEFAULTS_H_
++
++#include <zephyr/arch/arm/cortex_m/nvic.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Fill in CMSIS required values for non-CMSIS compliant SoCs.
++ * Use __NVIC_PRIO_BITS as it is required and simple to check, but
++ * ultimately all SoCs will define their own CMSIS types and constants.
++ */
++#ifndef __NVIC_PRIO_BITS
++typedef enum {
++	Reset_IRQn                    = -15,
++	NonMaskableInt_IRQn           = -14,
++	HardFault_IRQn                = -13,
++#if defined(CONFIG_ARMV7_M_ARMV8_M_MAINLINE)
++	MemoryManagement_IRQn         = -12,
++	BusFault_IRQn                 = -11,
++	UsageFault_IRQn               = -10,
++#if defined(CONFIG_ARM_SECURE_FIRMWARE)
++	SecureFault_IRQn              = -9,
++#endif /* CONFIG_ARM_SECURE_FIRMWARE */
++#endif /* CONFIG_ARMV7_M_ARMV8_M_MAINLINE */
++	SVCall_IRQn                   =  -5,
++	DebugMonitor_IRQn             =  -4,
++	PendSV_IRQn                   =  -2,
++	SysTick_IRQn                  =  -1,
++	Max_IRQn                      =  CONFIG_NUM_IRQS,
++} IRQn_Type;
++
++#if defined(CONFIG_CPU_CORTEX_M0)
++#define __CM0_REV        0
++#elif defined(CONFIG_CPU_CORTEX_M0PLUS)
++#define __CM0PLUS_REV    0
++#elif defined(CONFIG_CPU_CORTEX_M1)
++#define __CM1_REV        0
++#elif defined(CONFIG_CPU_CORTEX_M3)
++#define __CM3_REV        0
++#elif defined(CONFIG_CPU_CORTEX_M4)
++#define __CM4_REV        0
++#elif defined(CONFIG_CPU_CORTEX_M7)
++#define __CM7_REV        0
++#elif defined(CONFIG_CPU_CORTEX_M23)
++#define __CM23_REV       0
++#elif defined(CONFIG_CPU_CORTEX_M33)
++#define __CM33_REV       0
++#elif defined(CONFIG_CPU_CORTEX_M52)
++#define __CM52_REV       0
++#elif defined(CONFIG_CPU_CORTEX_M55)
++#define __CM55_REV       0
++#elif defined(CONFIG_CPU_CORTEX_M85)
++#define __CM85_REV       0
++#else
++#error "Unknown Cortex-M device"
++#endif
++
++#define __NVIC_PRIO_BITS               NUM_IRQ_PRIO_BITS
++#define __Vendor_SysTickConfig         0 /* Default to standard SysTick */
++#endif /* __NVIC_PRIO_BITS */
++
++#ifndef __MPU_PRESENT
++#define __MPU_PRESENT             CONFIG_CPU_HAS_ARM_MPU
++#endif
++
++#ifndef __FPU_PRESENT
++#define __FPU_PRESENT             CONFIG_CPU_HAS_FPU
++#endif
++
++#ifndef __FPU_DP
++#define __FPU_DP                  CONFIG_CPU_HAS_FPU_DOUBLE_PRECISION
++#endif
++
++#ifndef __VTOR_PRESENT
++#define __VTOR_PRESENT            CONFIG_CPU_CORTEX_M_HAS_VTOR
++#endif
++
++#ifndef __DSP_PRESENT
++#define __DSP_PRESENT             CONFIG_ARMV8_M_DSP
++#endif
++
++#ifndef __ICACHE_PRESENT
++#define __ICACHE_PRESENT          CONFIG_CPU_HAS_ICACHE
++#endif
++
++#ifndef __DCACHE_PRESENT
++#define __DCACHE_PRESENT          CONFIG_CPU_HAS_DCACHE
++#endif
++
++#ifndef __MVE_PRESENT
++#define __MVE_PRESENT             CONFIG_ARMV8_1_M_MVEI
++#endif
++
++#ifndef __SAUREGION_PRESENT
++#define __SAUREGION_PRESENT       CONFIG_CPU_HAS_ARM_SAU
++#endif
++
++#ifndef __PMU_PRESENT
++#define __PMU_PRESENT             CONFIG_ARMV8_1_M_PMU
++#define __PMU_NUM_EVENTCNT        CONFIG_ARMV8_1_M_PMU_EVENTCNT
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#if defined(CONFIG_CPU_CORTEX_M0)
++#include <core_cm0.h>
++#elif defined(CONFIG_CPU_CORTEX_M0PLUS)
++#include <core_cm0plus.h>
++#elif defined(CONFIG_CPU_CORTEX_M1)
++#include <core_cm1.h>
++#elif defined(CONFIG_CPU_CORTEX_M3)
++#include <core_cm3.h>
++#elif defined(CONFIG_CPU_CORTEX_M4)
++#include <core_cm4.h>
++#elif defined(CONFIG_CPU_CORTEX_M7)
++#include <core_cm7.h>
++#elif defined(CONFIG_CPU_CORTEX_M23)
++#include <core_cm23.h>
++#elif defined(CONFIG_CPU_CORTEX_M33)
++#include <core_cm33.h>
++#elif defined(CONFIG_CPU_CORTEX_M52)
++#include <core_cm52.h>
++#elif defined(CONFIG_CPU_CORTEX_M55)
++#include <core_cm55.h>
++#elif defined(CONFIG_CPU_CORTEX_M85)
++#include <core_cm85.h>
++#else
++#error "Unknown Cortex-M device"
++#endif
++
++#ifdef CONFIG_ARM_PAC
++/* This provides apis to set/get PAC keys */
++#define __ARM_FEATURE_PAUTH 1
++#include <m-profile/armv81m_pac.h>
++#endif
++
++#endif /* ZEPHYR_MODULES_CMSIS_CMSIS_CORE_M_DEFAULTS_H_ */
+diff --git a/scripts/kconfig/kconfiglib.py b/scripts/kconfig/kconfiglib.py
+index 316a4c4e40f4fc2add3b096ca13cd17399f46a13..264152b6598ad3e907cfa5b23112104733690a74 100644
+--- a/scripts/kconfig/kconfiglib.py
++++ b/scripts/kconfig/kconfiglib.py
+@@ -2171,16 +2171,18 @@ class Kconfig(object):
+         # doing in-place modification
+         self._include_path += ((self.filename, self.linenr),)
+ 
+-        # Check for recursive 'source'
++        # Check for recursive 'source' — skip instead of erroring.
++        # Zephyr's module system intentionally re-enters the root Kconfig
++        # via Kconfig.modules osource. Compare against filename (full path)
++        # too, because self.filename may be stored as relative or absolute
++        # depending on how the parent file was entered.
+         for name, _ in self._include_path:
+-            if name == rel_filename:
+-                raise KconfigError(
+-                    "\n{}:{}: recursive 'source' of '{}' detected. Check that "
+-                    "environment variables are set correctly.\n"
+-                    "Include path:\n{}"
+-                    .format(self.filename, self.linenr, rel_filename,
+-                            "\n".join("{}:{}".format(name, linenr)
+-                                      for name, linenr in self._include_path)))
++            if name == rel_filename or name == filename:
++                # Undo state changes and signal caller to skip
++                self._include_path = self._filestack[-1][0]
++                self._filestack.pop()
++                self.kconfig_filenames.pop()
++                return False
+ 
+         try:
+             self._readline = self._open(filename, "r").readline
+@@ -2194,6 +2196,7 @@ class Kconfig(object):
+ 
+         self.filename = rel_filename
+         self.linenr = 0
++        return True
+ 
+     def _leave_file(self):
+         # Returns from a Kconfig file to the file that sourced it. See
+@@ -2994,11 +2997,11 @@ class Kconfig(object):
+                                     if self.srctree else "unset or blank"))
+ 
+                 for filename in filenames:
+-                    self._enter_file(filename)
+-                    try:
+-                        prev = self._parse_block(None, parent, prev)
+-                    finally:
+-                        self._leave_file()
++                    if self._enter_file(filename):
++                        try:
++                            prev = self._parse_block(None, parent, prev)
++                        finally:
++                            self._leave_file()
+ 
+             elif t0 is end_token:
+                 # Reached the end of the block. Terminate the final node and
+diff --git a/west.yml b/west.yml
+index 9756634c435f11d139009614547f866b6df39d3c..0622ee6cbefdb057f8332600bae63e6281c8fe59 100644
+--- a/west.yml
++++ b/west.yml
+@@ -420,4 +420,4 @@ manifest:
+   self:
+     path: zephyr
+     west-commands: scripts/west-commands.yml
+-    import: submanifests
++    # import: submanifests
