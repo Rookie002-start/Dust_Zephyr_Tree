@@ -321,12 +321,12 @@ void Hipnuc::ParsePayload(const uint8_t* payload)
 
     // 角速度：X/Y/Z 对应 roll/pitch/yaw；Y 取负为安装方向补偿
     gyro_deg_[0] =  ReadLE<float>(payload + kOffGyro + 4);
-    gyro_deg_[1] = -ReadLE<float>(payload + kOffGyro);
+    gyro_deg_[1] =  ReadLE<float>(payload + kOffGyro);
     gyro_deg_[2] =  ReadLE<float>(payload + kOffGyro + 8);
 
     // 欧拉角：pitch 取负为安装方向补偿
     euler_deg_[0] =  ReadLE<float>(payload + kOffRoll);
-    euler_deg_[1] = -ReadLE<float>(payload + kOffPitch);
+    euler_deg_[1] =  ReadLE<float>(payload + kOffPitch);
     euler_deg_[2] =  ReadLE<float>(payload + kOffYaw);
 
     for (uint8_t i = 0; i < 4; i++) {
